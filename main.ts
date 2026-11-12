@@ -1,18 +1,49 @@
-// pumpfun-top5-forecast-01 entry: Monte Carlo forecaster (Node 22, stdlib only).
+// pumpfun-top5-forecast-01, entry v3 (Node 22, standard library only).
 // No network, no API keys, no model calls; fully deterministic (fixed seed).
 //
-// Per-coin log-cap paths (momentum with horizon decay, horizon-scaled noise,
-// fade hazard, graduation jumps) plus a synthetic newcomer field (empirical
-// young-coin caps with a heavy tail, shifted by the record trend). The
-// per-place newcomer share is estimated directly from the history's own lag
-// transitions (share of top-5 slots held by coins absent from earlier marks,
-// saturating in horizon, shrunk toward a prior) and the named probabilities
-// are scaled so the mass left unnamed matches it. Sizes mix known-holder and
-// newcomer-holder cap histograms with the same weight. Naming follows a
-// greedy proper-scoring rule: name a coin only while its probability beats
-// the unnamed per-coin share. All parameters are estimated from the history
-// given; nothing is hard-coded to the rehearsal. All horizons and times are
-// read from task.json, never hard-coded.
+// The same Monte Carlo machinery as v1/v2 (per-coin log-cap paths with
+// momentum saturation, fade hazard, graduation jumps, plus a synthetic
+// newcomer field whose count scales with the horizon and whose caps come
+// from the history's young top-20 coins), with six targeted repairs.
+// The full diagnosis, ablation record and honest risks are in BUILD_LOG.md.
+// In short, v2's split deficit was traced to three interacting defects:
+//
+//   1. THE LAG FIT COULD NOT REPRESENT FAST TURNOVER. fitSaturating's grid
+//      floored tau at 0.5h and capped fInf at 0.8, discarded buckets with
+//      fewer than 8 points, and shrank toward a slow prior (0.5, 2h). The
+//      history's own lag buckets show 60-90% of top-5 slots turning over
+//      within 10-30 minutes, yet the fitted curve predicted 4-10% at those
+//      lags. v1 survived only because its over-drawn newcomer field inflated
+//      the simulated newcomer frequency, which the max() in the unnamed-mass
+//      rule mistook for the fit. v2's correct horizon-scaled count removed
+//      that accidental compensation without repairing the fit, so the
+//      unnamed mass collapsed exactly on newcomer-held slots. v3 repairs
+//      the NEWCOMER fit only (wider grid, count-weighted buckets, a
+//      single-bucket fallback, a faster prior); the FADE fit is kept
+//      byte-for-byte v1/v2, because ablating a repaired fade fit cost
+//      1.7 nats: lag "fade" events are mostly rank churn and recorder
+//      sampling artefacts, not deaths to the tail floor.
+//   2. SIZES DOUBLE-COUNTED THE FIT. The size mixture weighted the
+//      newcomer-holder histogram by the order unnamed mass u, but u and
+//      the simulated newcomer frequency disagree exactly when the field
+//      is thin, and the newcomer conditional histogram is then a biased,
+//      noisy sample. Sizes score the MARGINAL place-cap distribution, so
+//      v3 mixes by the simulation's own newcomer frequency and lets the
+//      field model speak for the marginal.
+//   3. THE SIZE BLEND WAS HORIZON-BLIND. Blending 25% of a stationary
+//      place normal helps at 7-13h (where the simulation extrapolates)
+//      but drags sizes down and thins them at short horizons in a rising
+//      regime. v3 gates the blend weight by horizon: ~0.02-0.06 at
+//      sub-hour horizons, ~0.24 at the final's 7-13h.
+//
+// The remaining v3 changes: sparse marks (<10 rows) are excluded from lag
+// pairs (an empty mark cannot define "seen"); the size histogram is kernel
+// smoothed one bin each way (Monte Carlo histograms are noisy and the log
+// score punishes near-zero bins asymmetrically); the record trend is fitted
+// to the top-5 mean level instead of the single noisiest series (place 1),
+// with the same shrinkage and caps. All parameters are estimated from the
+// history given; nothing is hard-coded to the rehearsal. All horizons and
+// times are read from task.json.
 //
 // Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else /output).
 
@@ -22,10 +53,20 @@ import { join } from 'node:path';
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const SIMS = 6000;
+const SIMS = 40000;
 const SEED = 0x9e3779b9;
 const MAX_CANDIDATES = 300;
 const MICRO = 1_000_000;
+/** The most newcomers drawn in one simulated read. */
+const NEWCOMER_CAP = 200;
+/** Prior weight (in lag points) shrinking each per-place newcomer fit. */
+const PLACE_PRIOR_WEIGHT = 30;
+/** Ceiling of the horizon-gated size-blend weight (reached at long horizons). */
+const SIZE_BLEND_MAX = 0.3;
+/** Half-saturation horizon (hours) of the size-blend weight. */
+const SIZE_BLEND_HALF_H = 2;
+/** Kernel smoothing the per-place size histogram (must sum to 1). */
+const SIZE_SMOOTH_KERNEL = [0.25, 0.5, 0.25];
 
 interface Row {
   rank: number;
@@ -38,7 +79,8 @@ interface Row {
 interface Mark { at: string; ok: boolean; rows: Row[] | null; }
 
 const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
-  places: number; output: string; size: { edges: number[] }; reads: string[]; t0: string;
+  places: number; output: string; chart_size?: number;
+  size: { edges: number[] }; reads: string[]; t0: string;
 };
 const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((l) => l !== '');
 const marks = lines.map((l) => JSON.parse(l) as Mark).filter((m) => m.ok === true && Array.isArray(m.rows));
@@ -46,6 +88,7 @@ if (marks.length === 0) throw new Error('the history holds no ok mark');
 const places = task.places;
 const edges = task.size.edges;
 const bins = edges.length + 1;
+const CHART_SIZE = task.chart_size ?? 100;
 
 // ---------- deterministic PRNG ----------
 let rngState = SEED >>> 0;
@@ -68,10 +111,13 @@ function randn(): number {
 }
 function poisson(lambda: number): number {
   if (lambda <= 0) return 0;
-  const L = Math.exp(-lambda);
-  let k = 0, p = 1;
-  do { k++; p *= rnd(); } while (p > L && k < 200);
-  return k - 1;
+  if (lambda < 30) {
+    const L = Math.exp(-lambda);
+    let k = 0, p = 1;
+    do { k++; p *= rnd(); } while (p > L);
+    return k - 1;
+  }
+  return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
 }
 
 // ---------- trajectories ----------
@@ -113,7 +159,10 @@ const sortedRows = marks.map((m) => [...m.rows!].sort((a, b) => a.rank - b.rank)
 // per-place whether the coin at that place in j was absent from ALL marks <= i
 // (a "newcomer" w.r.t. i), plus whether a top-20 coin of i has faded by j.
 // The recent window matters: the early explosive regime must not dominate the
-// estimate for the market as it stands at the cut.
+// estimate for the market as it stands at the cut. Marks with almost no rows
+// (v3: fewer than 10) are skipped as either end of a pair: a mark that read
+// nothing cannot define what was "seen", and an empty later mark would count
+// every coin as faded.
 interface LagPoint { lag: number; place: number; newcomer: boolean; faded: boolean; }
 function lagPoints(): LagPoint[] {
   const pts: LagPoint[] = [];
@@ -121,10 +170,12 @@ function lagPoints(): LagPoint[] {
   const K = Math.max(6, Math.ceil(0.4 * n));
   const iMin = Math.max(0, n - K);
   for (let i = iMin; i < n; i++) {
+    if (marks[i]!.rows!.length < 10) continue;
     const topI = new Set(sortedRows[i]!.slice(0, 20).map((r) => r.mint));
     const seen = new Set<string>();
     for (let k = 0; k <= i; k++) for (const r of marks[k]!.rows!) seen.add(r.mint);
     for (let j = i + 1; j < n; j++) {
+      if (marks[j]!.rows!.length < 10) continue;
       const lag = (tMark[j]! - tMark[i]!) / HOUR;
       if (lag <= 0 || lag > 13) continue;
       const topJ = sortedRows[j]!.slice(0, places);
@@ -141,9 +192,9 @@ function lagPoints(): LagPoint[] {
   return pts;
 }
 const lagPts = lagPoints();
-// Fit f(h) = fInf * (1 - exp(-h / tau)) to bucketed shares by grid search, then
-// shrink the fitted parameters toward the prior in proportion to the evidence.
-function fitSaturating(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean, prior: { fInf: number; tau: number }): { fInf: number; tau: number } {
+// Shared bucket builder for the saturating fits: points are grouped by lag
+// (rounded to 10 minutes) with their newcomer/fade shares and counts.
+function lagBuckets(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean): { pts: Array<[number, number, number]>; nEff: number } {
   const buckets = new Map<number, { n: number; s: number }>();
   let nEff = 0;
   for (const p of lagPts) {
@@ -154,10 +205,20 @@ function fitSaturating(filter: (p: LagPoint) => boolean, value: (p: LagPoint) =>
     b.n++; if (value(p)) b.s++;
     buckets.set(key, b);
   }
-  const pts: Array<[number, number]> = [];
+  const pts: Array<[number, number, number]> = [];
   for (const [lag, b] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
-    if (b.n >= 8) pts.push([lag, b.s / b.n]);
+    pts.push([lag, b.s / b.n, b.n]);
   }
+  return { pts, nEff };
+}
+// The ORIGINAL saturating fit (v1/v2, verbatim behaviour): used ONLY for the fade curve.
+// Ablation showed a repaired fade fit costs ~1.7 nats, so the fade machinery
+// is deliberately left exactly as v1/v2 had it: unweighted buckets, a bucket
+// needs >= 8 points, fewer than 2 usable buckets returns the prior, the grid
+// floors tau at 0.5h and caps fInf at 0.8, shrinkage weight nEff/(nEff+40).
+function fitSaturatingOld(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean, prior: { fInf: number; tau: number }): { fInf: number; tau: number } {
+  const { pts: all, nEff } = lagBuckets(filter, value);
+  const pts: Array<[number, number]> = all.filter(([, , n]) => n >= 8).map(([lag, s]) => [lag, s]);
   const w = nEff / (nEff + 40);
   if (pts.length < 2) return prior;
   let best = { err: Infinity, fInf: prior.fInf, tau: prior.tau };
@@ -170,11 +231,59 @@ function fitSaturating(filter: (p: LagPoint) => boolean, value: (p: LagPoint) =>
   }
   return { fInf: w * best.fInf + (1 - w) * prior.fInf, tau: w * best.tau + (1 - w) * prior.tau };
 }
-const newcomerFit = fitSaturating((p) => p.place >= 1, (p) => p.newcomer, { fInf: 0.5, tau: 2 });
-const fadeFit = fitSaturating((p) => p.place === 0, (p) => p.faded, { fInf: 0.55, tau: 2 });
+// The REPAIRED saturating fit (v3): used for the newcomer curves only. Three
+// repairs over the original: (a) the grid reaches fast turnover (tau from
+// 0.08h) and near-total saturation (fInf to 0.98) — the old grid's tau floor
+// of 0.5h alone capped the 10-minute newcomer share at ~0.22 no matter what
+// the data said; (b) buckets are weighted by their point counts and no
+// bucket is discarded, so a single informative lag is used instead of
+// falling back to the prior; (c) with exactly one distinct lag, the curve
+// is pinned through that bucket at the prior's tau instead of returning
+// the prior untouched.
+function fitSaturatingNew(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean, prior: { fInf: number; tau: number }): { fInf: number; tau: number } {
+  const { pts, nEff } = lagBuckets(filter, value);
+  const w = nEff / (nEff + 20);
+  if (pts.length < 2) {
+    if (pts.length === 1) {
+      const [h, s] = pts[0]!;
+      const fInfNeed = s / Math.max(1e-6, 1 - Math.exp(-h / prior.tau));
+      const fInf = Math.min(0.98, Math.max(0.15, fInfNeed));
+      return { fInf: w * fInf + (1 - w) * prior.fInf, tau: prior.tau };
+    }
+    return prior;
+  }
+  let best = { err: Infinity, fInf: prior.fInf, tau: prior.tau };
+  for (let fInf = 0.15; fInf <= 0.98 + 1e-9; fInf += 0.05) {
+    for (let tau = 0.08; tau <= 10; tau *= 1.3) {
+      let err = 0;
+      for (const [h, s, nn] of pts) { const p = fInf * (1 - Math.exp(-h / tau)); err += nn * (p - s) * (p - s); }
+      if (err < best.err) best = { err, fInf, tau };
+    }
+  }
+  return { fInf: w * best.fInf + (1 - w) * prior.fInf, tau: w * best.tau + (1 - w) * prior.tau };
+}
+const newcomerFit = fitSaturatingNew((p) => p.place >= 1, (p) => p.newcomer, { fInf: 0.7, tau: 0.5 });
+const fadeFit = fitSaturatingOld((p) => p.place === 0, (p) => p.faded, { fInf: 0.55, tau: 2 });
 const newcomerShareAt = (h: number): number => newcomerFit.fInf * (1 - Math.exp(-h / newcomerFit.tau));
 const fadeProbAt = (h: number): number => fadeFit.fInf * (1 - Math.exp(-h / fadeFit.tau));
-const uDirect = horizons.reduce((a, h) => a + newcomerShareAt(h), 0) / Math.max(1, horizons.length);
+// Per-place newcomer curves: each place's own repaired fit, shrunk toward
+// the pooled curve. With few lag points the pooled curve dominates; with
+// the final's 66 marks the per-place evidence (notably place 1, which
+// turns over fastest) takes over.
+const placeNewcomerFit: Array<{ fInf: number; tau: number }> = [];
+const placeNewcomerN: number[] = [];
+for (let k = 1; k <= places; k++) {
+  placeNewcomerFit.push(fitSaturatingNew((p) => p.place === k, (p) => p.newcomer, { fInf: 0.7, tau: 0.5 }));
+  placeNewcomerN.push(lagPts.filter((p) => p.place === k).length);
+}
+const newcomerShareAtPlace = (k: number, h: number): number => {
+  const fit = placeNewcomerFit[k - 1]!;
+  const w = placeNewcomerN[k - 1]! / (placeNewcomerN[k - 1]! + PLACE_PRIOR_WEIGHT);
+  const own = fit.fInf * (1 - Math.exp(-h / fit.tau));
+  return w * own + (1 - w) * newcomerShareAt(h);
+};
+const uDirectPlace = (k: number): number =>
+  horizons.reduce((a, h) => a + newcomerShareAtPlace(k, h), 0) / Math.max(1, horizons.length);
 
 // ---------- drift / vol / graduation / newcomer caps ----------
 function meanSd(v: number[]): { mean: number; sd: number } {
@@ -257,15 +366,24 @@ let entrants = 0, spanH = 0;
   spanH = recent.length > 1 ? (tMark[recent[recent.length - 1]!]! - tMark[recent[0]!]!) / HOUR : 1;
 }
 const ARRIVAL_PER_H = Math.min(60, Math.max(2, entrants / Math.max(spanH, 0.25)));
-// Record trend: slope of the top-1 log-cap over the recent half, shrunk, capped.
+// Record trend (v3): slope of the TOP-5 MEAN log-cap over the recent half,
+// shrunk, capped. v1/v2 fitted place 1 alone — a single coin's series, the
+// noisiest estimate of the market level; the mean of five place series has
+// materially lower variance for the same level shift, which is what the
+// trend shift applies. The guard is 2 marks (was 3): with only two
+// non-empty marks the choice is between a bounded, shrunk slope and
+// asserting no trend at all, and the caps below bound the damage.
 let trendG = 0;
 {
   const nonEmpty = marks.map((m, i) => i).filter((i) => marks[i]!.rows!.length > 0);
   const take = Math.max(3, Math.ceil(nonEmpty.length / 2));
   const recent = nonEmpty.slice(-take);
-  if (recent.length >= 3) {
+  if (recent.length >= 2) {
     const xs = recent.map((i) => (tMark[i]! - tCut) / HOUR);
-    const ys = recent.map((i) => sizeOf(sortedRows[i]![0]!.market_cap_lamports));
+    const ys = recent.map((i) => {
+      const top = sortedRows[i]!.slice(0, 5);
+      return top.reduce((a, r) => a + sizeOf(r.market_cap_lamports), 0) / Math.max(1, top.length);
+    });
     const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
     const my = ys.reduce((a, b) => a + b, 0) / ys.length;
     let num = 0, den = 0;
@@ -317,6 +435,77 @@ const prepped: Prep[] = candidates.map((c) => {
   };
 });
 
+// ---------- place-level size model (the blend's second component) ----------
+// Each place's cap as its own persistence-plus-diffusion process: the mean
+// follows the place's own drift (fitted through the origin over all lag
+// pairs, shrunk hard toward zero when pairs are few, capped), and the spread
+// comes from consecutive-mark increments scaled by sqrt(h) — a deliberately
+// conservative estimator that cannot chase a 3-mark trend the way a
+// through-origin variance fit does.
+interface PlaceSize { lastCap: number; driftH: number; sdStep: number; dtMed: number }
+const placeSize: PlaceSize[] = [];
+for (let k = 0; k < places; k++) {
+  const series: Array<{ t: number; s: number }> = [];
+  for (let i = 0; i < marks.length; i++) {
+    const row = sortedRows[i]![k];
+    if (row !== undefined) series.push({ t: tMark[i]!, s: sizeOf(row.market_cap_lamports) });
+  }
+  const lastCap = series.length ? series[series.length - 1]!.s : 3;
+  let driftH = 0, sdStep = 0.15, dtMed = 1 / 6;
+  if (series.length >= 2) {
+    let num = 0, den = 0, nPairs = 0;
+    for (let i = 0; i < series.length; i++) {
+      for (let j = i + 1; j < series.length; j++) {
+        const lag = (series[j]!.t - series[i]!.t) / HOUR;
+        if (lag <= 0) continue;
+        num += (series[j]!.s - series[i]!.s) * lag; den += lag * lag; nPairs++;
+      }
+    }
+    if (den > 0) {
+      const raw = num / den;
+      const w = nPairs / (nPairs + 20);
+      driftH = Math.min(0.3, Math.max(-0.3, w * raw));
+    }
+    const steps: number[] = [], dts: number[] = [];
+    for (let i = 1; i < series.length; i++) {
+      const dt = (series[i]!.t - series[i - 1]!.t) / HOUR;
+      if (dt <= 0) continue;
+      steps.push(Math.abs(series[i]!.s - series[i - 1]!.s));
+      dts.push(dt);
+    }
+    if (steps.length) {
+      steps.sort((a, b) => a - b);
+      dts.sort((a, b) => a - b);
+      sdStep = Math.max(0.1, steps[Math.floor(steps.length / 2)]! / 0.6745);
+      dtMed = dts[Math.floor(dts.length / 2)]!;
+    }
+  }
+  placeSize.push({ lastCap, driftH, sdStep, dtMed });
+}
+
+/** erfc(x), Numerical Recipes' erfcc (fractional error under 1.2e-7). */
+function erfc(x: number): number {
+  const z = Math.abs(x);
+  const t = 1 / (1 + 0.5 * z);
+  const r = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
+  return x >= 0 ? r : 2 - r;
+}
+const above = (x: number, mean: number, sd: number): number => (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
+
+/** The place-level normal's bin probabilities for place k at horizon h. */
+function placeNormalBins(k: number, h: number): number[] {
+  const { lastCap, driftH, sdStep, dtMed } = placeSize[k]!;
+  const mean = lastCap + Math.min(0.5, Math.max(-0.5, driftH * h));
+  const sd = Math.min(0.5, Math.max(0.15, sdStep * Math.sqrt(Math.max(h, 0.02) / Math.max(dtMed, 0.02))));
+  const probs = new Array<number>(bins).fill(0);
+  for (let bin = 0; bin < bins; bin++) {
+    const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
+    const hi = bin === edges.length ? Infinity : edges[bin]!;
+    probs[bin] = above(lo, mean, sd) - above(hi, mean, sd);
+  }
+  return probs;
+}
+
 // ---------- Monte Carlo ----------
 const placeFreq: Array<Map<string, number>> = Array.from({ length: places }, () => new Map());
 const newcomerFreq = new Array<number>(places).fill(0);
@@ -341,7 +530,9 @@ for (let s = 0; s < SIMS; s++) {
   for (let ri = 0; ri < horizons.length; ri++) {
     const h = horizons[ri]!;
     for (let i = 0; i < nPrep; i++) caps[i] = sampleCoin(prepped[i]!, h);
-    const nNew = Math.min(60, poisson(ARRIVAL_PER_H * 1.0));
+    // Arrivals are a Poisson process in time: the newcomer count scales
+    // with the horizon (v1 drew one hour's worth at every horizon).
+    const nNew = Math.min(NEWCOMER_CAP, poisson(ARRIVAL_PER_H * h));
     const all: Array<{ x: number; mint: string | null }> = [];
     for (let i = 0; i < nPrep; i++) all.push({ x: caps[i]!, mint: prepped[i]!.mint });
     for (let j = 0; j < nNew; j++) all.push({ x: sampleNewcomerCap() + trendShift(h), mint: null });
@@ -360,10 +551,13 @@ for (let s = 0; s < SIMS; s++) {
   }
 }
 
-// Unnamed mass per place: max(direct lag estimate, simulated newcomer frequency).
+// Unnamed mass per place: max(the place's direct lag estimate, the simulated
+// newcomer frequency), capped at 0.9. The max is a safety floor: under the
+// log score, under-hedging a newcomer-held slot costs far more than the
+// dilution over-hedging costs on known-held slots.
 const uPlace: number[] = [];
-for (let k = 0; k < places; k++) {
-  uPlace.push(Math.min(0.9, Math.max(uDirect, newcomerFreq[k]! / totalSamples)));
+for (let k = 1; k <= places; k++) {
+  uPlace.push(Math.min(0.9, Math.max(uDirectPlace(k), newcomerFreq[k - 1]! / totalSamples)));
 }
 
 // ---------- emit probabilities (greedy proper-scoring naming) ----------
@@ -378,12 +572,12 @@ for (let k = 1; k <= places; k++) {
   const cands = [...freq.entries()]
     .map(([mint, n]) => ({ mint, q: (n / totalSamples) * scale }))
     .sort((a, b) => b.q - a.q);
-  // Greedy: name while q beats the unnamed per-coin share (chart ~100 coins).
+  // Greedy: name while q beats the unnamed per-coin share (chart_size coins).
   const rows: Array<{ mint: string; p: number }> = [];
   let sum = 0;
   for (const c of cands) {
     if (rows.length >= 100) break;
-    const unnamedCoins = Math.max(1, 100 - rows.length);
+    const unnamedCoins = Math.max(1, CHART_SIZE - rows.length);
     const share = (1 - sum) / unnamedCoins;
     if (c.q < share * 0.999) break;
     const p = Math.floor(c.q * MICRO) / MICRO;
@@ -397,17 +591,48 @@ for (let k = 1; k <= places; k++) {
   for (const r of rows) probabilities.push({ mint: r.mint, place: k, p: r.p });
 }
 
-// ---------- emit sizes (mix known/newcomer histograms by u) ----------
+// ---------- emit sizes ----------
+// v3: the mixture weight is the simulation's own newcomer frequency, NOT
+// the order unnamed mass u. Sizes score the marginal place-cap
+// distribution, and the simulation's marginal — known/newcomer histograms
+// mixed by their simulated frequencies — is the field model's estimate of
+// it. Reweighting by u (v1/v2) double-counts the lag fit and, when the
+// field is thin, leans on a biased newcomer conditional. The place-normal
+// blend is horizon-gated: w(h) = SIZE_BLEND_MAX * h / (h + HALF), averaged
+// over the reads, so the stationary anchor barely touches short-horizon
+// forecasts and carries ~0.24 weight at the final's 7-13h. The result is
+// kernel-smoothed one bin each way: Monte Carlo bin counts are noisy, and
+// smoothing trades a little peak sharpness for insurance against
+// off-by-one-bin misses, which the log score punishes asymmetrically.
+const blendW = (h: number): number => SIZE_BLEND_MAX * h / (h + SIZE_BLEND_HALF_H);
+const W_BAR = horizons.reduce((a, h) => a + blendW(h), 0) / Math.max(1, horizons.length);
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 1; k <= places; k++) {
-  const u = uPlace[k - 1]!;
   const simNew = newcomerFreq[k - 1]! / totalSamples;
   const knownN = Math.max(1, totalSamples - newcomerFreq[k - 1]!);
   const newN = Math.max(1, newcomerFreq[k - 1]!);
+  const pn = new Array<number>(bins).fill(0);
+  for (const h of horizons) {
+    const b = placeNormalBins(k - 1, h);
+    for (let i = 0; i < bins; i++) pn[i]! += b[i]! / horizons.length;
+  }
+  const probs = new Array<number>(bins).fill(0);
   for (let b = 0; b < bins; b++) {
     const pk = sizeHistKnown[k - 1]![b]! / knownN;
-    const pn = simNew > 0 ? sizeHistNew[k - 1]![b]! / newN : 0;
-    const p = Math.floor(((1 - u) * pk + u * pn) * MICRO) / MICRO;
+    const pnw = simNew > 0 ? sizeHistNew[k - 1]![b]! / newN : 0;
+    const mix = (1 - simNew) * pk + simNew * pnw;
+    probs[b] = (1 - W_BAR) * mix + W_BAR * pn[b]!;
+  }
+  const sm = new Array<number>(bins).fill(0);
+  for (let b = 0; b < bins; b++) {
+    const lo = b > 0 ? probs[b - 1]! : 0;
+    const hi = b < bins - 1 ? probs[b + 1]! : 0;
+    sm[b] = SIZE_SMOOTH_KERNEL[0]! * lo + SIZE_SMOOTH_KERNEL[1]! * probs[b]! + SIZE_SMOOTH_KERNEL[2]! * hi;
+  }
+  const tot = sm.reduce((a, v) => a + v, 0);
+  const finalProbs = tot > 0 ? sm.map((v) => v / tot) : sm;
+  for (let b = 0; b < bins; b++) {
+    const p = Math.floor(finalProbs[b]! * MICRO) / MICRO;
     if (p > 0) sizes.push({ place: k, bin: b, p });
   }
 }
