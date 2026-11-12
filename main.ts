@@ -1,680 +1,1259 @@
-// pumpfun-top5-forecast-01, entry v6 (Node 22, standard library only).
-// No network, no API keys, no model calls; fully deterministic (fixed seed).
+// Forecast the top 5 pump.fun coins by market cap at the answer reads.
 //
-// v6 = v5 + two targeted patches (see BUILD_LOG.md for the full record,
-// the ablation evidence, and the honest risks). v5 has no server score
-// (its first submission was rejected on transcript-bundle checks, not on
-// code); v3 (-37.31 practice) remains the best server-verified entry.
-// The two patches, both verified in the v6 lab from the v5 basis:
+// Model (written from the prose design documents, no prior code read):
+// a seeded Monte Carlo over candidate coins with momentum-saturation
+// drift, venue-specific diffusion, fade-to-floor, a flat graduation
+// hazard with a unimodal jump to observed post-graduation caps, a curve
+// ceiling, and a newcomer field drawn from young top-20 peak caps with
+// a trend shift and a tail extension. Place-level size distributions
+// blend the Monte Carlo histograms with a conservative per-place anchor
+// under an effective-sample-size gate, then take horizon-mix-gated
+// tempering. Order probabilities leave an unnamed mass per place from
+// lag-pair newcomer fits and simulated newcomer frequency. On top of
+// that base, two measured additions: a horizon-gated downward shift and
+// widening of the size distributions, and a half-weight blend of the
+// order probabilities with a Luce model and a direct scoring model.
 //
-//   Q1. SIZE BLEND CEILING 0.3 -> 0.5. The place-normal anchor (the
-//       conservative size component) carries more weight at long
-//       horizons, where the Monte Carlo extrapolates roughly a decade
-//       above realised caps. The ESS gate is unchanged, so short-horizon
-//       reads barely feel it (splits cost -0.03). Evidence: the anchor
-//       direction wins on all six synthetic long-horizon datasets (four
-//       regimes, two seeds; +1.9 to +2.5) — but those magnitudes are
-//       overstated (the synthetic truth is mean-reverting like the
-//       anchor), so only the DIRECTION is claimed, with a winner's-curse
-//       haircut. Doses above 0.5 were deliberately not explored: chasing
-//       the synthetic optimum would be selecting on the test set.
-//   Q2. HORIZON-MIX-GATED TEMPERING. The final size probabilities are
-//       sharpened by alpha = 1 + 0.15*exp(-hbar/2), where hbar is the
-//       mean read horizon: ~1.13 on short-horizon splits (where a
-//       sharpening signal was measured), ~1.001 at the final's 7-13h
-//       (effectively off — verified identical long-horizon shape and
-//       ~0.00 synthetic transfer). The forecast schema carries ONE size
-//       distribution per place for all reads, so per-read gating is
-//       impossible; the horizon MIX is the legitimate gate. The splits
-//       gain (+0.08) is within noise and is NOT claimed as established.
-//
-// Everything else is v5 verbatim: the same Monte Carlo machinery
-// (per-coin log-cap paths with momentum saturation, fade hazard,
-// graduation jumps, plus a synthetic newcomer field whose count scales
-// with the horizon and whose caps come from the history's young top-20
-// coins), with v3's six repairs and v5's three patches (arrival span +
-// cadence bug fix; size mixture weight = u; ESS-gated blend weight).
-// The lineage, the v4 failure diagnosis (pool-only newcomer cap), and
-// the rejected v6 candidates (saturating trend, newcomer-tail removal)
-// are recorded in BUILD_LOG.md. All parameters are estimated from the
-// history given; nothing is hard-coded to the rehearsal. All horizons
-// and times are read from task.json.
-//
-// Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else /output).
+// Deterministic: fixed seeds, no clock, no environment randomness.
+// Node builtins only. Reads $MAKEFUN_INPUT_DIR (else /input), writes
+// $MAKEFUN_OUTPUT_DIR/forecast.json (else /output/forecast.json).
 
-import { readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import * as fs from "node:fs";
+import * as path from "node:path";
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+/* ---------------------------------------------------------------- */
+/* Constants                                                         */
+/* ---------------------------------------------------------------- */
 
-const SIMS = 40000;
-const SEED = 0x9e3779b9;
+const N_PATHS = 40000;
 const MAX_CANDIDATES = 300;
-const MICRO = 1_000_000;
-/** The most newcomers drawn in one simulated read. */
-const NEWCOMER_CAP = 200;
-/** Prior weight (in lag points) shrinking each per-place newcomer fit. */
-const PLACE_PRIOR_WEIGHT = 30;
-/** Ceiling of the horizon-gated size-blend weight (reached at long horizons). v6 Q1: raised 0.3 -> 0.5; see header + BUILD_LOG.md. */
+const MAX_NEWCOMERS = 200;
+const TOP_BY_SIZE = 120;
+const TOP_BY_MOMENTUM = 60;
+const TAU_MOMENTUM_H = 2;
 const SIZE_BLEND_MAX = 0.5;
-/** Half-saturation horizon (hours) of the size-blend weight (v3 rational gate; superseded by the v5 ESS gate, retained unused). */
-const SIZE_BLEND_HALF_H = 2;
-/** Kernel smoothing the per-place size histogram (must sum to 1). */
-const SIZE_SMOOTH_KERNEL = [0.25, 0.5, 0.25];
+const CURVE_CEILING = 2.55;
+const TAIL_PROB = 0.15;
+const TAIL_MEAN_DEX = 0.25;
+const FADE_DROP_DEX = 2.0;
+const FADE_SD_DEX = 0.2;
+const TEMP_STRENGTH = 0.15;
+const TEMP_TAU_H = 2;
+const ESS_GATE_K = 40;
+const SEED_MC = 123456789;
+const SEED_ENSEMBLE = 987654321;
+const GUMBEL_DRAWS = 20000;
+const MAX_ROWS_PER_PLACE = 100;
+const PROB_FLOOR = 1e-6;
+const SHIFT_DEX = 0.2;
+const SHIFT_HORIZON_H = 10;
+const WIDEN_DEX = 0.15;
+const WIDEN_HORIZON_H = 10;
+const UNNAMED_CAP = 0.9;
+const PLACES = 5;
 
-interface Row {
-  rank: number;
-  mint: string;
-  market_cap_lamports: string | number;
-  venue: string;
-  created_at: string;
-  mayhem?: boolean;
-}
-interface Mark { at: string; ok: boolean; rows: Row[] | null; }
+/* ---------------------------------------------------------------- */
+/* Deterministic randomness                                          */
+/* ---------------------------------------------------------------- */
 
-const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
-  places: number; output: string; chart_size?: number;
-  size: { edges: number[] }; reads: string[]; t0: string;
-};
-const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((l) => l !== '');
-const marks = lines.map((l) => JSON.parse(l) as Mark).filter((m) => m.ok === true && Array.isArray(m.rows));
-if (marks.length === 0) throw new Error('the history holds no ok mark');
-const places = task.places;
-const edges = task.size.edges;
-const bins = edges.length + 1;
-const CHART_SIZE = task.chart_size ?? 100;
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function (): number {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
-// ---------- deterministic PRNG ----------
-let rngState = SEED >>> 0;
-function rnd(): number {
-  rngState = (rngState + 0x6d2b79f5) >>> 0;
-  let t = rngState;
-  t = Math.imul(t ^ (t >>> 15), t | 1);
-  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+// Standard normals from a uniform stream (Marsaglia polar method,
+// with the spare value cached). Deterministic given the stream.
+function makeGauss(rand: () => number): () => number {
+  let spare: number | null = null;
+  return function (): number {
+    if (spare !== null) {
+      const v = spare;
+      spare = null;
+      return v;
+    }
+    let u = 0;
+    let v = 0;
+    let s = 0;
+    do {
+      u = rand() * 2 - 1;
+      v = rand() * 2 - 1;
+      s = u * u + v * v;
+    } while (s >= 1 || s === 0);
+    const m = Math.sqrt((-2 * Math.log(s)) / s);
+    spare = v * m;
+    return u * m;
+  };
 }
-let spare: number | null = null;
-function randn(): number {
-  if (spare !== null) { const v = spare; spare = null; return v; }
-  let u = 0;
-  while (u === 0) u = rnd();
-  const r = Math.sqrt(-2 * Math.log(u));
-  const t = 2 * Math.PI * rnd();
-  spare = r * Math.sin(t);
-  return r * Math.cos(t);
-}
-function poisson(lambda: number): number {
+
+function poissonSample(rand: () => number, gauss: () => number, lambda: number): number {
   if (lambda <= 0) return 0;
-  if (lambda < 30) {
-    const L = Math.exp(-lambda);
-    let k = 0, p = 1;
-    do { k++; p *= rnd(); } while (p > L);
-    return k - 1;
+  if (lambda > 30) {
+    const v = Math.round(lambda + Math.sqrt(lambda) * gauss());
+    return v < 0 ? 0 : v;
   }
-  return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
+  const limit = Math.exp(-lambda);
+  let k = 0;
+  let p = 1;
+  do {
+    k++;
+    p *= rand();
+  } while (p > limit);
+  return k - 1;
 }
 
-// ---------- trajectories ----------
-const sizeOf = (lamports: string | number): number => Math.log10(Number(BigInt(lamports))) - 9;
-const tMark = marks.map((m) => Date.parse(m.at) / 1000);
-const tCut = tMark[tMark.length - 1]!;
-const horizons = task.reads.length > 0
-  ? task.reads.map((r) => Math.max(0, (Date.parse(r) / 1000 - tCut) / 3600))
-  : [1]; // degenerate fallback: the competition always lists reads
-const HOUR = 3600;
-
-interface Obs { t: number; x: number; venue: string; rank: number; }
-interface Coin {
-  mint: string; obs: Obs[]; created: number; mayhem: boolean;
-  lastX: number; lastVenue: string; lastRank: number; lastT: number;
+// Standard normal CDF (Abramowitz & Stegun 7.1.26).
+function normCdf(x: number): number {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989422804014327 * Math.exp(-0.5 * x * x);
+  let p =
+    d *
+    t *
+    (0.31938153 +
+      t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  if (x > 0) p = 1 - p;
+  return p;
 }
-const coins = new Map<string, Coin>();
-for (let i = 0; i < marks.length; i++) {
-  const m = marks[i]!;
-  for (const r of m.rows!) {
-    let c = coins.get(r.mint);
-    if (!c) {
-      c = { mint: r.mint, obs: [], created: Date.parse(r.created_at) / 1000, mayhem: !!r.mayhem, lastX: 0, lastVenue: r.venue, lastRank: r.rank, lastT: tMark[i]! };
-      coins.set(r.mint, c);
+
+/* ---------------------------------------------------------------- */
+/* Small numeric helpers                                             */
+/* ---------------------------------------------------------------- */
+
+function clamp(x: number, lo: number, hi: number): number {
+  return x < lo ? lo : x > hi ? hi : x;
+}
+
+function median(vals: number[]): number {
+  if (vals.length === 0) return 0;
+  const s = [...vals].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 === 1 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+function renormalize(a: number[]): void {
+  let s = 0;
+  for (const v of a) s += v;
+  if (s > 0) {
+    for (let i = 0; i < a.length; i++) a[i] /= s;
+  }
+}
+
+// Bin of a size value under the task's edges: bin 0 below the first
+// edge, bin i in [edges[i-1], edges[i]) for 1..80, bin 81 at/above
+// the last edge.
+function binIndex(x: number, edges: number[]): number {
+  const n = edges.length;
+  if (x < edges[0]) return 0;
+  if (x >= edges[n - 1]) return n;
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (edges[mid] <= x) lo = mid;
+    else hi = mid;
+  }
+  return lo + 1;
+}
+
+// Piecewise-linear interpolation of (xs, ys) at x; zero outside the
+// range of xs.
+function interpAt(xs: number[], ys: number[], x: number): number {
+  const n = xs.length;
+  if (x < xs[0] || x > xs[n - 1]) return 0;
+  if (x === xs[0]) return ys[0];
+  if (x === xs[n - 1]) return ys[n - 1];
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (xs[mid] <= x) lo = mid;
+    else hi = mid;
+  }
+  const t = (x - xs[lo]) / (xs[hi] - xs[lo]);
+  return ys[lo] * (1 - t) + ys[hi] * t;
+}
+
+function floor6(p: number): number {
+  const v = Math.floor(p * 1e6) / 1e6;
+  return v < 0 ? 0 : v;
+}
+
+/* ---------------------------------------------------------------- */
+/* Input parsing                                                     */
+/* ---------------------------------------------------------------- */
+
+interface RowData {
+  mint: string;
+  size: number; // log10 of market cap in SOL
+  venue: string;
+  rank: number;
+  createdAt: number; // ms
+  reservesSol: number;
+  mayhem: boolean;
+}
+
+interface MarkData {
+  at: number; // ms
+  rows: RowData[]; // rank ascending
+}
+
+interface TaskData {
+  reads: number[]; // ms
+  edges: number[];
+  cadenceMinutes: number;
+}
+
+function parseMarks(text: string): MarkData[] {
+  const marks: MarkData[] = [];
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const obj = JSON.parse(trimmed);
+    const at = Date.parse(obj.at);
+    const rows: RowData[] = [];
+    const rawRows = Array.isArray(obj.rows) ? obj.rows : [];
+    for (const r of rawRows) {
+      const cap = Number(r.market_cap_lamports);
+      const size = Math.log10(cap > 0 ? cap : 1) - 9;
+      let createdAt = Date.parse(r.created_at);
+      if (!Number.isFinite(createdAt)) createdAt = at;
+      rows.push({
+        mint: String(r.mint),
+        size,
+        venue: String(r.venue || "curve"),
+        rank: Number(r.rank) || 0,
+        createdAt,
+        reservesSol: Number(r.quote_reserves_lamports || 0) / 1e9,
+        mayhem: Boolean(r.mayhem),
+      });
     }
-    c.obs.push({ t: tMark[i]!, x: sizeOf(r.market_cap_lamports), venue: r.venue, rank: r.rank });
-    c.lastX = c.obs[c.obs.length - 1]!.x;
-    c.lastVenue = r.venue;
-    c.lastRank = r.rank;
-    c.lastT = tMark[i]!;
-    if (r.mayhem) c.mayhem = true;
+    rows.sort((a, b) => a.rank - b.rank);
+    marks.push({ at, rows });
   }
+  marks.sort((a, b) => a.at - b.at);
+  return marks;
 }
-const coinList = [...coins.values()];
-const sortedRows = marks.map((m) => [...m.rows!].sort((a, b) => a.rank - b.rank));
 
-// ---------- helpers for lag analysis ----------
-// For every pair of marks (i, j>i) with i in the recent window: lag in hours, and
-// per-place whether the coin at that place in j was absent from ALL marks <= i
-// (a "newcomer" w.r.t. i), plus whether a top-20 coin of i has faded by j.
-// The recent window matters: the early explosive regime must not dominate the
-// estimate for the market as it stands at the cut. Marks with almost no rows
-// (v3: fewer than 10) are skipped as either end of a pair: a mark that read
-// nothing cannot define what was "seen", and an empty later mark would count
-// every coin as faded.
-interface LagPoint { lag: number; place: number; newcomer: boolean; faded: boolean; }
-function lagPoints(): LagPoint[] {
-  const pts: LagPoint[] = [];
-  const n = marks.length;
-  const K = Math.max(6, Math.ceil(0.4 * n));
-  const iMin = Math.max(0, n - K);
-  for (let i = iMin; i < n; i++) {
-    if (marks[i]!.rows!.length < 10) continue;
-    const topI = new Set(sortedRows[i]!.slice(0, 20).map((r) => r.mint));
-    const seen = new Set<string>();
-    for (let k = 0; k <= i; k++) for (const r of marks[k]!.rows!) seen.add(r.mint);
-    for (let j = i + 1; j < n; j++) {
-      if (marks[j]!.rows!.length < 10) continue;
-      const lag = (tMark[j]! - tMark[i]!) / HOUR;
-      if (lag <= 0 || lag > 13) continue;
-      const topJ = sortedRows[j]!.slice(0, places);
-      const rankJ = new Map(marks[j]!.rows!.map((r) => [r.mint, r.rank]));
-      for (let k = 0; k < topJ.length; k++) {
-        pts.push({ lag, place: k + 1, newcomer: !seen.has(topJ[k]!.mint), faded: false });
+function parseTask(obj: Record<string, unknown>): TaskData {
+  const readsRaw = Array.isArray(obj.reads) ? (obj.reads as unknown[]) : [];
+  const reads = readsRaw.map((r) => Date.parse(String(r))).filter((t) => Number.isFinite(t));
+  const sizeObj = (obj.size as Record<string, unknown>) || {};
+  const edgesRaw = Array.isArray(sizeObj.edges) ? (sizeObj.edges as unknown[]) : [];
+  const edges = edgesRaw.map((e) => Number(e)).filter((e) => Number.isFinite(e));
+  return {
+    reads,
+    edges: edges.length >= 2 ? edges : [2, 6],
+    cadenceMinutes: Number(obj.cadence_minutes) || 10,
+  };
+}
+
+/* ---------------------------------------------------------------- */
+/* Per-coin histories and features                                   */
+/* ---------------------------------------------------------------- */
+
+interface Obs {
+  t: number;
+  size: number;
+  venue: string;
+  rank: number;
+  reservesSol: number;
+  createdAt: number;
+}
+
+interface CoinFeatures {
+  mint: string;
+  obs: Obs[];
+  lastSize: number;
+  lastVenue: string;
+  lastRank: number;
+  lastReservesSol: number;
+  createdAt: number;
+  momentum: number; // dex per hour, capped to [-1, 1]
+  ageHours: number; // at the last mark, floored at 0
+}
+
+function buildCoinHistories(marks: MarkData[]): Map<string, Obs[]> {
+  const byMint = new Map<string, Obs[]>();
+  for (const mark of marks) {
+    for (const row of mark.rows) {
+      let list = byMint.get(row.mint);
+      if (!list) {
+        list = [];
+        byMint.set(row.mint, list);
       }
-      for (const m of topI) {
-        const rk = rankJ.get(m);
-        pts.push({ lag, place: 0, newcomer: false, faded: rk === undefined || rk > 50 });
-      }
+      list.push({
+        t: mark.at,
+        size: row.size,
+        venue: row.venue,
+        rank: row.rank,
+        reservesSol: row.reservesSol,
+        createdAt: row.createdAt,
+      });
     }
   }
-  return pts;
+  return byMint;
 }
-const lagPts = lagPoints();
-// Shared bucket builder for the saturating fits: points are grouped by lag
-// (rounded to 10 minutes) with their newcomer/fade shares and counts.
-function lagBuckets(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean): { pts: Array<[number, number, number]>; nEff: number } {
-  const buckets = new Map<number, { n: number; s: number }>();
-  let nEff = 0;
-  for (const p of lagPts) {
-    if (!filter(p)) continue;
-    nEff++;
-    const key = Math.round(p.lag * 6) / 6;
-    const b = buckets.get(key) ?? { n: 0, s: 0 };
-    b.n++; if (value(p)) b.s++;
-    buckets.set(key, b);
-  }
-  const pts: Array<[number, number, number]> = [];
-  for (const [lag, b] of [...buckets.entries()].sort((a, b) => a[0] - b[0])) {
-    pts.push([lag, b.s / b.n, b.n]);
-  }
-  return { pts, nEff };
-}
-// The ORIGINAL saturating fit (v1/v2, verbatim behaviour): used ONLY for the fade curve.
-// Ablation showed a repaired fade fit costs ~1.7 nats, so the fade machinery
-// is deliberately left exactly as v1/v2 had it: unweighted buckets, a bucket
-// needs >= 8 points, fewer than 2 usable buckets returns the prior, the grid
-// floors tau at 0.5h and caps fInf at 0.8, shrinkage weight nEff/(nEff+40).
-function fitSaturatingOld(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean, prior: { fInf: number; tau: number }): { fInf: number; tau: number } {
-  const { pts: all, nEff } = lagBuckets(filter, value);
-  const pts: Array<[number, number]> = all.filter(([, , n]) => n >= 8).map(([lag, s]) => [lag, s]);
-  const w = nEff / (nEff + 40);
-  if (pts.length < 2) return prior;
-  let best = { err: Infinity, fInf: prior.fInf, tau: prior.tau };
-  for (let fInf = 0.15; fInf <= 0.8; fInf += 0.05) {
-    for (let tau = 0.5; tau <= 10; tau *= 1.3) {
-      let err = 0;
-      for (const [h, s] of pts) { const p = fInf * (1 - Math.exp(-h / tau)); err += (p - s) * (p - s); }
-      if (err < best.err) best = { err, fInf, tau };
-    }
-  }
-  return { fInf: w * best.fInf + (1 - w) * prior.fInf, tau: w * best.tau + (1 - w) * prior.tau };
-}
-// The REPAIRED saturating fit (v3): used for the newcomer curves only. Three
-// repairs over the original: (a) the grid reaches fast turnover (tau from
-// 0.08h) and near-total saturation (fInf to 0.98) — the old grid's tau floor
-// of 0.5h alone capped the 10-minute newcomer share at ~0.22 no matter what
-// the data said; (b) buckets are weighted by their point counts and no
-// bucket is discarded, so a single informative lag is used instead of
-// falling back to the prior; (c) with exactly one distinct lag, the curve
-// is pinned through that bucket at the prior's tau instead of returning
-// the prior untouched.
-function fitSaturatingNew(filter: (p: LagPoint) => boolean, value: (p: LagPoint) => boolean, prior: { fInf: number; tau: number }): { fInf: number; tau: number } {
-  const { pts, nEff } = lagBuckets(filter, value);
-  const w = nEff / (nEff + 20);
-  if (pts.length < 2) {
-    if (pts.length === 1) {
-      const [h, s] = pts[0]!;
-      const fInfNeed = s / Math.max(1e-6, 1 - Math.exp(-h / prior.tau));
-      const fInf = Math.min(0.98, Math.max(0.15, fInfNeed));
-      return { fInf: w * fInf + (1 - w) * prior.fInf, tau: prior.tau };
-    }
-    return prior;
-  }
-  let best = { err: Infinity, fInf: prior.fInf, tau: prior.tau };
-  for (let fInf = 0.15; fInf <= 0.98 + 1e-9; fInf += 0.05) {
-    for (let tau = 0.08; tau <= 10; tau *= 1.3) {
-      let err = 0;
-      for (const [h, s, nn] of pts) { const p = fInf * (1 - Math.exp(-h / tau)); err += nn * (p - s) * (p - s); }
-      if (err < best.err) best = { err, fInf, tau };
-    }
-  }
-  return { fInf: w * best.fInf + (1 - w) * prior.fInf, tau: w * best.tau + (1 - w) * prior.tau };
-}
-const newcomerFit = fitSaturatingNew((p) => p.place >= 1, (p) => p.newcomer, { fInf: 0.7, tau: 0.5 });
-const fadeFit = fitSaturatingOld((p) => p.place === 0, (p) => p.faded, { fInf: 0.55, tau: 2 });
-const newcomerShareAt = (h: number): number => newcomerFit.fInf * (1 - Math.exp(-h / newcomerFit.tau));
-const fadeProbAt = (h: number): number => fadeFit.fInf * (1 - Math.exp(-h / fadeFit.tau));
-// Per-place newcomer curves: each place's own repaired fit, shrunk toward
-// the pooled curve. With few lag points the pooled curve dominates; with
-// the final's 66 marks the per-place evidence (notably place 1, which
-// turns over fastest) takes over.
-const placeNewcomerFit: Array<{ fInf: number; tau: number }> = [];
-const placeNewcomerN: number[] = [];
-for (let k = 1; k <= places; k++) {
-  placeNewcomerFit.push(fitSaturatingNew((p) => p.place === k, (p) => p.newcomer, { fInf: 0.7, tau: 0.5 }));
-  placeNewcomerN.push(lagPts.filter((p) => p.place === k).length);
-}
-const newcomerShareAtPlace = (k: number, h: number): number => {
-  const fit = placeNewcomerFit[k - 1]!;
-  const w = placeNewcomerN[k - 1]! / (placeNewcomerN[k - 1]! + PLACE_PRIOR_WEIGHT);
-  const own = fit.fInf * (1 - Math.exp(-h / fit.tau));
-  return w * own + (1 - w) * newcomerShareAt(h);
-};
-const uDirectPlace = (k: number): number =>
-  horizons.reduce((a, h) => a + newcomerShareAtPlace(k, h), 0) / Math.max(1, horizons.length);
 
-// ---------- drift / vol / graduation / newcomer caps ----------
-function meanSd(v: number[]): { mean: number; sd: number } {
-  if (v.length === 0) return { mean: 0, sd: 0.5 };
-  const mean = v.reduce((a, b) => a + b, 0) / v.length;
-  const sd = Math.sqrt(v.reduce((a, b) => a + (b - mean) * (b - mean), 0) / Math.max(1, v.length - 1));
-  return { mean, sd: Math.max(sd, 0.05) };
-}
-function deltasBy(venuePred: (v: string) => boolean): number[] {
-  const out: number[] = [];
-  // Recent half of the marks: the current regime's volatility, not the opening explosion's.
-  const cutIdx = Math.floor(marks.length / 2);
-  const tFrom = tMark[cutIdx]!;
-  for (const c of coinList) {
-    for (let j = 1; j < c.obs.length; j++) {
-      const a = c.obs[j - 1]!, b = c.obs[j]!;
-      if (a.t < tFrom) continue;
-      const dt = (b.t - a.t) / HOUR;
-      if (dt <= 0 || dt > 1.01) continue;
-      if (!venuePred(a.venue)) continue;
-      out.push((b.x - a.x) / dt);
+// Hourly momentum: size change between the last observation and the
+// observation at or before one hour earlier, over the elapsed hours
+// (minimum one sixth of an hour), capped to [-1, 1]. When no
+// observation is an hour old yet, the earliest observation stands in;
+// a single observation gives zero momentum.
+function momentumOf(obs: Obs[]): number {
+  if (obs.length < 2) return 0;
+  const last = obs[obs.length - 1];
+  const target = last.t - 3600e3;
+  let ref: Obs | null = null;
+  for (let i = obs.length - 1; i >= 0; i--) {
+    if (obs[i].t <= target) {
+      ref = obs[i];
+      break;
     }
+  }
+  if (ref === null) ref = obs[0];
+  const elapsedH = Math.max(1 / 6, (last.t - ref.t) / 3600e3);
+  return clamp((last.size - ref.size) / elapsedH, -1, 1);
+}
+
+function buildFeatures(byMint: Map<string, Obs[]>, lastMarkAt: number): CoinFeatures[] {
+  const out: CoinFeatures[] = [];
+  for (const [mint, obs] of byMint) {
+    const last = obs[obs.length - 1];
+    out.push({
+      mint,
+      obs,
+      lastSize: last.size,
+      lastVenue: last.venue,
+      lastRank: last.rank,
+      lastReservesSol: last.reservesSol,
+      createdAt: obs[0].createdAt,
+      momentum: momentumOf(obs),
+      ageHours: Math.max(0, (lastMarkAt - obs[0].createdAt) / 3600e3),
+    });
   }
   return out;
 }
-const poolD = meanSd(deltasBy((v) => v === 'pool' || v === 'migrating'));
-const curveD = meanSd(deltasBy((v) => v === 'curve'));
-const POOL_DRIFT = Math.min(0.3, Math.max(-0.3, 0.5 * poolD.mean + 0.5 * -0.05));
-const POOL_SIGMA_H = Math.min(0.8, Math.max(0.25, poolD.sd));
-const CURVE_SIGMA_H = Math.min(0.5, Math.max(0.1, curveD.sd));
-let curveHours = 0, graduations = 0;
-const gradCaps: number[] = [];
-for (const c of coinList) {
-  for (let j = 1; j < c.obs.length; j++) {
-    const a = c.obs[j - 1]!, b = c.obs[j]!;
-    const dt = (b.t - a.t) / HOUR;
-    if (dt <= 0 || dt > 1.01) continue;
-    if (a.venue === 'curve') {
-      curveHours += dt;
-      if (b.venue === 'pool' || b.venue === 'migrating') { graduations++; gradCaps.push(b.x); }
+
+/* ---------------------------------------------------------------- */
+/* Lag-pair saturating fits                                          */
+/* ---------------------------------------------------------------- */
+
+interface Saturating {
+  c: number; // ceiling
+  tau: number; // time constant, hours
+}
+
+function evalSat(f: Saturating, h: number): number {
+  return f.c * (1 - Math.exp(-h / f.tau));
+}
+
+interface FitPoint {
+  h: number;
+  y: number;
+}
+
+// Grid-search fit of c * (1 - exp(-h/tau)). Ties resolve toward fast
+// time constants and high ceilings when preferFast, toward slow and
+// low otherwise.
+function fitSaturating(points: FitPoint[], preferFast: boolean): Saturating {
+  const cGrid: number[] = [];
+  for (let c = 0.5; c <= 1.0001; c += 0.05) cGrid.push(Math.round(c * 100) / 100);
+  const tauGrid = [0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24];
+  const cOrder = preferFast ? [...cGrid].reverse() : cGrid;
+  const tauOrder = preferFast ? tauGrid : [...tauGrid].reverse();
+  let best: Saturating = { c: 0.9, tau: 1 };
+  let bestSse = Infinity;
+  for (const c of cOrder) {
+    for (const tau of tauOrder) {
+      let sse = 0;
+      for (const p of points) {
+        const pred = c * (1 - Math.exp(-p.h / tau));
+        const d = p.y - pred;
+        sse += d * d;
+      }
+      if (sse < bestSse) {
+        bestSse = sse;
+        best = { c, tau };
+      }
     }
   }
+  return best;
 }
-const gradRate = graduations > 0 ? Math.min(2, graduations / Math.max(1, curveHours)) : 0.05;
-const gradCapsFiltered = gradCaps.filter((x) => x > 2.3 && x < 4.5);
-const gradCap = meanSd(gradCapsFiltered.length ? gradCapsFiltered : [2.9]);
-const GRAD_MEAN = gradCapsFiltered.length >= 3 ? gradCap.mean : 2.9;
-const GRAD_SD = gradCapsFiltered.length >= 3 ? Math.min(0.6, Math.max(0.2, gradCap.sd)) : 0.4;
-// Newcomer caps: observations of coins that reached the top 20, while younger
-// than 1h — the cap a hot arrival actually holds at a random young age.
-// (Matched to the arrival rate, which counts top-20 entrants.)
-const peakCaps: number[] = [];
-for (const c of coinList) {
-  if (!c.obs.some((o) => o.rank <= 20)) continue;
-  for (const o of c.obs) {
-    const age = (o.t - c.created) / HOUR;
-    if (age >= 0 && age < 1) peakCaps.push(o.x);
-  }
-}
-peakCaps.sort((a, b) => a - b);
-function sampleNewcomerCap(): number {
-  if (peakCaps.length === 0) return 2.7 + 0.5 * randn();
-  const base = peakCaps[Math.floor(rnd() * peakCaps.length)]!;
-  // Heavy-tail extension: occasionally exceed the observed max.
-  if (rnd() < 0.15) return base + -Math.log(1 - rnd()) * 0.25;
-  return base;
-}
-// Arrival rate: coins first seen in a top-20, per hour, recent half of marks.
-// (v5: nonEmptyMarks is computed once and shared with the trend block below;
-// the two v3 blocks computed the identical list independently.)
-const nonEmptyMarks = marks.map((m, i) => i).filter((i) => marks[i]!.rows!.length > 0);
-let entrants = 0, spanH = 0;
-{
-  const nonEmpty = nonEmptyMarks;
-  const recent = nonEmpty.slice(Math.floor(nonEmpty.length / 2));
-  const seenBefore = new Set<string>();
-  for (const i of nonEmpty) {
-    for (const r of sortedRows[i]!.slice(0, 20)) {
-      if (recent.includes(i) && !seenBefore.has(r.mint)) entrants++;
-      seenBefore.add(r.mint);
-    }
-  }
-  // v5 P1: the span covers first-to-last PLUS one cadence (the median
-  // inter-mark gap), because the first-to-last span alone understates the
-  // window over which entrants were counted; a single mark uses the
-  // cadence instead of a flat 1 hour.
-  {
-    const gaps: number[] = [];
-    for (let gi = 1; gi < tMark.length; gi++) { const g = (tMark[gi]! - tMark[gi - 1]!) / HOUR; if (g > 0) gaps.push(g); }
-    gaps.sort((a, b) => a - b);
-    const cadenceH = gaps.length ? gaps[Math.floor(gaps.length / 2)]! : 1 / 6;
-    spanH = recent.length > 1 ? (tMark[recent[recent.length - 1]!]! - tMark[recent[0]!]!) / HOUR + cadenceH : cadenceH;
-  }
-}
-const ARRIVAL_PER_H = Math.min(60, Math.max(2, entrants / Math.max(spanH, 0.25)));
-// Record trend (v3): slope of the TOP-5 MEAN log-cap over the recent half,
-// shrunk, capped. v1/v2 fitted place 1 alone — a single coin's series, the
-// noisiest estimate of the market level; the mean of five place series has
-// materially lower variance for the same level shift, which is what the
-// trend shift applies. The guard is 2 marks (was 3): with only two
-// non-empty marks the choice is between a bounded, shrunk slope and
-// asserting no trend at all, and the caps below bound the damage.
-let trendG = 0;
-{
-  const nonEmpty = nonEmptyMarks;
-  const take = Math.max(3, Math.ceil(nonEmpty.length / 2));
-  const recent = nonEmpty.slice(-take);
-  if (recent.length >= 2) {
-    const xs = recent.map((i) => (tMark[i]! - tCut) / HOUR);
-    const ys = recent.map((i) => {
-      const top = sortedRows[i]!.slice(0, 5);
-      return top.reduce((a, r) => a + sizeOf(r.market_cap_lamports), 0) / Math.max(1, top.length);
-    });
-    const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
-    const my = ys.reduce((a, b) => a + b, 0) / ys.length;
-    let num = 0, den = 0;
-    for (let i = 0; i < xs.length; i++) { num += (xs[i]! - mx) * (ys[i]! - my); den += (xs[i]! - mx) * (xs[i]! - mx); }
-    const slope = den > 0 ? num / den : 0;
-    trendG = Math.min(0.2, Math.max(-0.1, 0.5 * slope)); // shrink + cap (per hour)
-  }
-}
-const trendShift = (h: number): number => Math.min(0.8, Math.max(-0.5, trendG * h));
 
-// ---------- candidates ----------
-const momentum = new Map<string, number>();
-for (const c of coinList) {
-  const o = c.obs;
-  if (o.length >= 2) {
-    const a = o[Math.max(0, o.length - 3)]!, b = o[o.length - 1]!;
-    momentum.set(c.mint, (b.x - a.x) / Math.max(0.05, (b.t - a.t) / HOUR));
-  } else momentum.set(c.mint, 0);
-}
-const byLastCap = [...coinList].sort((a, b) => b.lastX - a.lastX);
-const candSet = new Set<string>();
-for (const c of byLastCap.slice(0, 120)) candSet.add(c.mint);
-for (const c of [...coinList].sort((a, b) => (momentum.get(b.mint) ?? 0) - (momentum.get(a.mint) ?? 0)).slice(0, 60)) candSet.add(c.mint);
-for (const c of coinList) if (c.lastVenue === 'pool' || c.lastVenue === 'migrating') candSet.add(c.mint);
-for (const c of coinList) if ((tCut - c.created) / HOUR < 2 && c.lastX > 2.0) candSet.add(c.mint);
-const lastIdx = marks.length - 1;
-let candidates = [...candSet].map((m) => coins.get(m)!).filter((c) => c.lastT >= tMark[Math.max(0, lastIdx - 1)]!);
-candidates.sort((a, b) => b.lastX - a.lastX);
-candidates = candidates.slice(0, MAX_CANDIDATES);
-
-const TAU_MOMENTUM = 2.0;
-const SIGMA_MAX = 1.0;
-const CURVE_CEILING = 2.55;
-interface Prep { mint: string; x0: number; drift: number; sigmaH: number; curve: boolean; }
-const prepped: Prep[] = candidates.map((c) => {
-  const o = c.obs;
-  let slope = 0;
-  if (o.length >= 2) {
-    const a = o[Math.max(0, o.length - 4)]!, b = o[o.length - 1]!;
-    slope = (b.x - a.x) / Math.max(0.05, (b.t - a.t) / HOUR);
-  }
-  const prior = c.lastVenue === 'curve' ? 0 : POOL_DRIFT;
-  const w = Math.min(0.7, o.length / (o.length + 3));
+function shrinkFit(own: Saturating, pooled: Saturating, n: number, prior: number): Saturating {
+  const w = n / (n + prior);
   return {
-    mint: c.mint, x0: c.lastX,
-    drift: Math.min(1.2, Math.max(-1.2, w * slope + (1 - w) * prior)),
-    sigmaH: c.lastVenue === 'curve' ? CURVE_SIGMA_H : POOL_SIGMA_H,
-    curve: c.lastVenue === 'curve',
+    c: w * own.c + (1 - w) * pooled.c,
+    tau: w * own.tau + (1 - w) * pooled.tau,
   };
-});
+}
 
-// ---------- place-level size model (the blend's second component) ----------
-// Each place's cap as its own persistence-plus-diffusion process: the mean
-// follows the place's own drift (fitted through the origin over all lag
-// pairs, shrunk hard toward zero when pairs are few, capped), and the spread
-// comes from consecutive-mark increments scaled by sqrt(h) — a deliberately
-// conservative estimator that cannot chase a 3-mark trend the way a
-// through-origin variance fit does.
-interface PlaceSize { lastCap: number; driftH: number; sdStep: number; dtMed: number }
-const placeSize: PlaceSize[] = [];
-for (let k = 0; k < places; k++) {
-  const series: Array<{ t: number; s: number }> = [];
-  for (let i = 0; i < marks.length; i++) {
-    const row = sortedRows[i]![k];
-    if (row !== undefined) series.push({ t: tMark[i]!, s: sizeOf(row.market_cap_lamports) });
+interface LagCurves {
+  newcomer: Saturating[]; // per place, shrunk toward pooled
+  newcomerPooled: Saturating;
+  fade: Saturating[]; // per place, shrunk toward pooled
+  fadePooled: Saturating;
+}
+
+function fitLagCurves(marks: MarkData[], byMint: Map<string, Obs[]>): LagCurves {
+  const defaults: LagCurves = {
+    newcomer: Array.from({ length: PLACES }, () => ({ c: 0.9, tau: 1 })),
+    newcomerPooled: { c: 0.9, tau: 1 },
+    fade: Array.from({ length: PLACES }, () => ({ c: 0.5, tau: 4 })),
+    fadePooled: { c: 0.5, tau: 4 },
+  };
+  const m = marks.length;
+  if (m < 2) return defaults;
+
+  const firstSeen = new Map<string, number>();
+  for (let i = 0; i < m; i++) {
+    for (const row of marks[i].rows) {
+      if (!firstSeen.has(row.mint)) firstSeen.set(row.mint, i);
+    }
   }
-  const lastCap = series.length ? series[series.length - 1]!.s : 3;
-  let driftH = 0, sdStep = 0.15, dtMed = 1 / 6;
-  if (series.length >= 2) {
-    let num = 0, den = 0, nPairs = 0;
-    for (let i = 0; i < series.length; i++) {
-      for (let j = i + 1; j < series.length; j++) {
-        const lag = (series[j]!.t - series[i]!.t) / HOUR;
-        if (lag <= 0) continue;
-        num += (series[j]!.s - series[i]!.s) * lag; den += lag * lag; nPairs++;
+  const markMaps: Map<string, RowData>[] = marks.map((mark) => {
+    const map = new Map<string, RowData>();
+    for (const row of mark.rows) map.set(row.mint, row);
+    return map;
+  });
+  const top20: string[][] = marks.map((mark) => mark.rows.slice(0, 20).map((r) => r.mint));
+
+  const newcomerPoints: FitPoint[][] = Array.from({ length: PLACES }, () => []);
+  const newcomerPooledPoints: FitPoint[] = [];
+  const fadePoints: FitPoint[][] = Array.from({ length: PLACES }, () => []);
+  const fadePooledPoints: FitPoint[] = [];
+  let nPairs = 0;
+  for (let i = 0; i < m; i++) {
+    for (let j = i + 1; j < m; j++) {
+      const h = (marks[j].at - marks[i].at) / 3600e3;
+      if (h <= 0) continue;
+      nPairs++;
+      // Newcomer share: is the coin at place k in mark j new since mark i?
+      for (let k = 0; k < PLACES; k++) {
+        const rowJ = marks[j].rows[k];
+        if (!rowJ) continue;
+        const y = (firstSeen.get(rowJ.mint) as number) > i ? 1 : 0;
+        newcomerPoints[k].push({ h, y });
+        newcomerPooledPoints.push({ h, y });
       }
-    }
-    if (den > 0) {
-      const raw = num / den;
-      const w = nPairs / (nPairs + 20);
-      driftH = Math.min(0.3, Math.max(-0.3, w * raw));
-    }
-    const steps: number[] = [], dts: number[] = [];
-    for (let i = 1; i < series.length; i++) {
-      const dt = (series[i]!.t - series[i - 1]!.t) / HOUR;
-      if (dt <= 0) continue;
-      steps.push(Math.abs(series[i]!.s - series[i - 1]!.s));
-      dts.push(dt);
-    }
-    if (steps.length) {
-      steps.sort((a, b) => a - b);
-      dts.sort((a, b) => a - b);
-      sdStep = Math.max(0.1, steps[Math.floor(steps.length / 2)]! / 0.6745);
-      dtMed = dts[Math.floor(dts.length / 2)]!;
-    }
-  }
-  placeSize.push({ lastCap, driftH, sdStep, dtMed });
-}
-
-/** erfc(x), Numerical Recipes' erfcc (fractional error under 1.2e-7). */
-function erfc(x: number): number {
-  const z = Math.abs(x);
-  const t = 1 / (1 + 0.5 * z);
-  const r = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
-  return x >= 0 ? r : 2 - r;
-}
-const above = (x: number, mean: number, sd: number): number => (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
-
-/** The place-level normal's bin probabilities for place k at horizon h. */
-function placeNormalBins(k: number, h: number): number[] {
-  const { lastCap, driftH, sdStep, dtMed } = placeSize[k]!;
-  const mean = lastCap + Math.min(0.5, Math.max(-0.5, driftH * h));
-  const sd = Math.min(0.5, Math.max(0.15, sdStep * Math.sqrt(Math.max(h, 0.02) / Math.max(dtMed, 0.02))));
-  const probs = new Array<number>(bins).fill(0);
-  for (let bin = 0; bin < bins; bin++) {
-    const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
-    const hi = bin === edges.length ? Infinity : edges[bin]!;
-    probs[bin] = above(lo, mean, sd) - above(hi, mean, sd);
-  }
-  return probs;
-}
-
-// ---------- Monte Carlo ----------
-const placeFreq: Array<Map<string, number>> = Array.from({ length: places }, () => new Map());
-const newcomerFreq = new Array<number>(places).fill(0);
-const sizeHistKnown: number[][] = Array.from({ length: places }, () => new Array<number>(bins).fill(0));
-const sizeHistNew: number[][] = Array.from({ length: places }, () => new Array<number>(bins).fill(0));
-const totalSamples = SIMS * horizons.length;
-const binOfX = (x: number): number => { let b = 0; while (b < edges.length && edges[b]! <= x) b++; return b; };
-
-function sampleCoin(p: Prep, h: number): number {
-  if (rnd() < fadeProbAt(h)) return 1.45 + 0.25 * randn();
-  if (p.curve && rnd() < 1 - Math.exp(-gradRate * h)) return GRAD_MEAN + GRAD_SD * randn() + trendShift(h);
-  const mean = p.x0 + p.drift * TAU_MOMENTUM * (1 - Math.exp(-h / TAU_MOMENTUM)) + trendShift(h);
-  const sd = Math.min(SIGMA_MAX, p.sigmaH * Math.sqrt(Math.max(h, 0.02)));
-  let x = mean + sd * randn();
-  if (p.curve) x = Math.min(x, CURVE_CEILING);
-  return x;
-}
-
-const nPrep = prepped.length;
-const caps = new Float64Array(nPrep);
-for (let s = 0; s < SIMS; s++) {
-  for (let ri = 0; ri < horizons.length; ri++) {
-    const h = horizons[ri]!;
-    for (let i = 0; i < nPrep; i++) caps[i] = sampleCoin(prepped[i]!, h);
-    // Arrivals are a Poisson process in time: the newcomer count scales
-    // with the horizon (v1 drew one hour's worth at every horizon).
-    const nNew = Math.min(NEWCOMER_CAP, poisson(ARRIVAL_PER_H * h));
-    const all: Array<{ x: number; mint: string | null }> = [];
-    for (let i = 0; i < nPrep; i++) all.push({ x: caps[i]!, mint: prepped[i]!.mint });
-    for (let j = 0; j < nNew; j++) all.push({ x: sampleNewcomerCap() + trendShift(h), mint: null });
-    all.sort((a, b) => b.x - a.x);
-    for (let k = 0; k < places; k++) {
-      const top = all[k];
-      if (!top) break;
-      const bin = binOfX(top.x);
-      if (top.mint === null) { newcomerFreq[k]!++; sizeHistNew[k]![bin]!++; }
-      else {
-        const m = placeFreq[k]!;
-        m.set(top.mint, (m.get(top.mint) ?? 0) + 1);
-        sizeHistKnown[k]![bin]!++;
+      // Fade: did a top-20 coin of mark i vanish or collapse by mark j?
+      for (let k = 0; k < PLACES; k++) {
+        const rowI = marks[i].rows[k];
+        if (!rowI) continue;
+        const rowJ = markMaps[j].get(rowI.mint);
+        const y = !rowJ || rowJ.size < rowI.size - 1.0 ? 1 : 0;
+        fadePoints[k].push({ h, y });
+      }
+      for (const mint of top20[i]) {
+        const rowI = markMaps[i].get(mint) as RowData;
+        const rowJ = markMaps[j].get(mint);
+        const y = !rowJ || rowJ.size < rowI.size - 1.0 ? 1 : 0;
+        fadePooledPoints.push({ h, y });
       }
     }
   }
+  if (nPairs === 0) return defaults;
+
+  const newcomerPooled = fitSaturating(newcomerPooledPoints, true);
+  const fadePooled = fitSaturating(fadePooledPoints, false);
+  const newcomer = newcomerPoints.map((pts) =>
+    pts.length > 0 ? shrinkFit(fitSaturating(pts, true), newcomerPooled, nPairs, 10) : newcomerPooled
+  );
+  const fade = fadePoints.map((pts) =>
+    pts.length > 0 ? shrinkFit(fitSaturating(pts, false), fadePooled, nPairs, 10) : fadePooled
+  );
+  void byMint;
+  return { newcomer, newcomerPooled, fade, fadePooled };
 }
 
-// Unnamed mass per place: max(the place's direct lag estimate, the simulated
-// newcomer frequency), capped at 0.9. The max is a safety floor: under the
-// log score, under-hedging a newcomer-held slot costs far more than the
-// dilution over-hedging costs on known-held slots.
-const uPlace: number[] = [];
-for (let k = 1; k <= places; k++) {
-  uPlace.push(Math.min(0.9, Math.max(uDirectPlace(k), newcomerFreq[k - 1]! / totalSamples)));
+/* ---------------------------------------------------------------- */
+/* History-estimated model quantities                                */
+/* ---------------------------------------------------------------- */
+
+interface Estimated {
+  // Volatility per hour by venue (pooled fallback included).
+  sigmaByVenue: Map<string, number>;
+  sigmaPooled: number;
+  // Post-graduation jump distribution (unimodal normal).
+  jumpMean: number;
+  jumpSd: number;
+  // Flat graduation hazard per hour.
+  gradLambda: number;
+  // Newcomer peak caps.
+  peakCaps: number[];
+  // Market trend, dex per hour.
+  trendG: number;
+  // Top-20 entrant arrival rate per hour.
+  arrival: number;
 }
 
-// ---------- emit probabilities (greedy proper-scoring naming) ----------
-const probabilities: Array<{ mint: string; place: number; p: number }> = [];
-for (let k = 1; k <= places; k++) {
-  const freq = placeFreq[k - 1]!;
-  const u = uPlace[k - 1]!;
-  const simNew = newcomerFreq[k - 1]! / totalSamples;
-  // Rescale named probs so the named sum is 1 - u (sim's known mass is 1 - simNew).
-  const knownMass = Math.max(1e-9, 1 - simNew);
-  const scale = (1 - u) / knownMass;
-  const cands = [...freq.entries()]
-    .map(([mint, n]) => ({ mint, q: (n / totalSamples) * scale }))
-    .sort((a, b) => b.q - a.q);
-  // Greedy: name while q beats the unnamed per-coin share (chart_size coins).
-  const rows: Array<{ mint: string; p: number }> = [];
+function estimateQuantities(
+  marks: MarkData[],
+  features: CoinFeatures[],
+  byMint: Map<string, Obs[]>,
+  cadenceMinutes: number
+): Estimated {
+  // Venue-specific diffusion from pooled consecutive-mark deltas.
+  const deltasByVenue = new Map<string, number[]>();
+  const allDeltas: number[] = [];
+  for (const coin of features) {
+    const obs = coin.obs;
+    for (let i = 1; i < obs.length; i++) {
+      const dtH = (obs[i].t - obs[i - 1].t) / 3600e3;
+      if (dtH <= 0) continue;
+      const d = (obs[i].size - obs[i - 1].size) / Math.sqrt(dtH);
+      allDeltas.push(d);
+      if (obs[i].venue === obs[i - 1].venue) {
+        const list = deltasByVenue.get(obs[i].venue) || [];
+        list.push(d);
+        deltasByVenue.set(obs[i].venue, list);
+      }
+    }
+  }
+  const sigmaFrom = (ds: number[]): number => {
+    if (ds.length === 0) return 0.3;
+    const mad = median(ds.map((d) => Math.abs(d)));
+    return clamp(mad / 0.6745, 0.05, 0.6);
+  };
+  const sigmaPooled = sigmaFrom(allDeltas);
+  const sigmaByVenue = new Map<string, number>();
+  for (const [venue, ds] of deltasByVenue) {
+    sigmaByVenue.set(venue, ds.length >= 10 ? sigmaFrom(ds) : sigmaPooled);
+  }
+
+  // Post-graduation caps: first pool/migrating observation after a
+  // curve observation, per coin. Unimodal normal fit; default centre
+  // near 2.05 when too few are observed.
+  const postGrad: number[] = [];
+  let graduations = 0;
+  for (const coin of features) {
+    const obs = coin.obs;
+    let sawCurve = false;
+    for (const o of obs) {
+      if (o.venue === "curve") sawCurve = true;
+      else if (sawCurve && (o.venue === "pool" || o.venue === "migrating")) {
+        postGrad.push(o.size);
+        graduations++;
+        break;
+      }
+    }
+  }
+  let jumpMean = 2.05;
+  let jumpSd = 0.5;
+  if (postGrad.length >= 4) {
+    const mean = postGrad.reduce((a, b) => a + b, 0) / postGrad.length;
+    const varSum = postGrad.reduce((a, b) => a + (b - mean) * (b - mean), 0);
+    jumpMean = mean;
+    jumpSd = clamp(Math.sqrt(varSum / (postGrad.length - 1)), 0.25, 0.8);
+  }
+
+  // Flat graduation hazard: graduations over curve-coin exposure.
+  let exposureH = 0;
+  for (let i = 0; i < marks.length - 1; i++) {
+    const dtH = (marks[i + 1].at - marks[i].at) / 3600e3;
+    if (dtH <= 0) continue;
+    let curveRows = 0;
+    for (const row of marks[i].rows) if (row.venue === "curve") curveRows++;
+    exposureH += curveRows * dtH;
+  }
+  const gradLambda = exposureH > 0 ? clamp(graduations / exposureH, 0.001, 0.5) : 0.05;
+
+  // Newcomer peak caps: peak sizes of coins seen in the top 20 while
+  // under one hour old.
+  const peakCaps: number[] = [];
+  for (const coin of features) {
+    let youngTop20 = false;
+    let peak = -Infinity;
+    for (const o of coin.obs) {
+      if (o.size > peak) peak = o.size;
+      const ageH = (o.t - o.createdAt) / 3600e3;
+      if (o.rank >= 1 && o.rank <= 20 && ageH < 1) youngTop20 = true;
+    }
+    if (youngTop20 && Number.isFinite(peak)) peakCaps.push(peak);
+  }
+  if (peakCaps.length === 0 && marks.length > 0) {
+    for (const row of marks[marks.length - 1].rows.slice(0, 20)) peakCaps.push(row.size);
+  }
+  if (peakCaps.length === 0) peakCaps.push(2.5);
+
+  // Market trend: OLS slope of the per-mark top-20 median size.
+  let trendG = 0;
+  if (marks.length >= 2) {
+    const t0 = marks[0].at;
+    let sx = 0;
+    let sy = 0;
+    let sxx = 0;
+    let sxy = 0;
+    let n = 0;
+    for (const mark of marks) {
+      const top = mark.rows.slice(0, 20).map((r) => r.size);
+      if (top.length === 0) continue;
+      const x = (mark.at - t0) / 3600e3;
+      const y = median(top);
+      sx += x;
+      sy += y;
+      sxx += x * x;
+      sxy += x * y;
+      n++;
+    }
+    const denom = n * sxx - sx * sx;
+    if (n >= 2 && denom > 0) trendG = clamp((n * sxy - sx * sy) / denom, -0.2, 0.2);
+  }
+
+  // Arrival rate: first-time top-20 entrants over the recent half of
+  // marks, with the cadence-span correction.
+  let arrival = 20;
+  if (marks.length >= 2) {
+    const recentStart = Math.floor(marks.length / 2);
+    const seenTop20 = new Set<string>();
+    for (let i = 0; i < recentStart; i++) {
+      for (const row of marks[i].rows.slice(0, 20)) seenTop20.add(row.mint);
+    }
+    let entrants = 0;
+    for (let i = recentStart; i < marks.length; i++) {
+      for (const row of marks[i].rows.slice(0, 20)) {
+        if (!seenTop20.has(row.mint)) {
+          seenTop20.add(row.mint);
+          entrants++;
+        }
+      }
+    }
+    const spanH =
+      (marks[marks.length - 1].at - marks[recentStart].at) / 3600e3 + cadenceMinutes / 60;
+    if (spanH > 0 && entrants > 0) arrival = entrants / spanH;
+  }
+
+  void byMint;
+  return {
+    sigmaByVenue,
+    sigmaPooled,
+    jumpMean,
+    jumpSd,
+    gradLambda,
+    peakCaps,
+    trendG,
+    arrival,
+  };
+}
+
+/* ---------------------------------------------------------------- */
+/* Candidate selection                                               */
+/* ---------------------------------------------------------------- */
+
+function selectCandidates(features: CoinFeatures[]): CoinFeatures[] {
+  const chosen: CoinFeatures[] = [];
+  const taken = new Set<string>();
+  const add = (coin: CoinFeatures): boolean => {
+    if (taken.has(coin.mint) || chosen.length >= MAX_CANDIDATES) return false;
+    taken.add(coin.mint);
+    chosen.push(coin);
+    return true;
+  };
+  const bySize = [...features].sort((a, b) => b.lastSize - a.lastSize);
+  for (const coin of bySize.slice(0, TOP_BY_SIZE)) add(coin);
+  const byMomentum = [...features].sort((a, b) => b.momentum - a.momentum);
+  for (const coin of byMomentum.slice(0, TOP_BY_MOMENTUM)) add(coin);
+  for (const coin of bySize) {
+    if (coin.lastVenue === "pool" || coin.lastVenue === "migrating") add(coin);
+  }
+  for (const coin of bySize) {
+    if (coin.ageHours < 1) add(coin);
+  }
+  if (chosen.length < MAX_CANDIDATES) {
+    for (const coin of bySize) add(coin);
+  }
+  return chosen;
+}
+
+/* ---------------------------------------------------------------- */
+/* Monte Carlo                                                       */
+/* ---------------------------------------------------------------- */
+
+interface McResult {
+  orderCounts: Int32Array[]; // [place][candidate]
+  newcomerCounts: Int32Array; // [place]
+  sizeHist: Int32Array[]; // [place][bin]
+  totalSamples: number;
+}
+
+function runMonteCarlo(
+  candidates: CoinFeatures[],
+  est: Estimated,
+  curves: LagCurves,
+  horizons: number[],
+  edges: number[]
+): McResult {
+  const nCand = candidates.length;
+  const nBins = edges.length + 1;
+  const nReads = horizons.length;
+  const orderCounts: Int32Array[] = Array.from({ length: PLACES }, () => new Int32Array(nCand));
+  const newcomerCounts = new Int32Array(PLACES);
+  const sizeHist: Int32Array[] = Array.from({ length: PLACES }, () => new Int32Array(nBins));
+
+  const lastSize = new Float64Array(nCand);
+  const mom = new Float64Array(nCand);
+  const sig = new Float64Array(nCand);
+  const isCurve = new Uint8Array(nCand);
+  const fadeCurve: Saturating[] = new Array(nCand);
+  for (let i = 0; i < nCand; i++) {
+    const c = candidates[i];
+    lastSize[i] = c.lastSize;
+    mom[i] = c.momentum;
+    sig[i] = est.sigmaByVenue.get(c.lastVenue) ?? est.sigmaPooled;
+    isCurve[i] = c.lastVenue === "curve" ? 1 : 0;
+    fadeCurve[i] =
+      c.lastRank >= 1 && c.lastRank <= PLACES ? curves.fade[c.lastRank - 1] : curves.fadePooled;
+  }
+  const peakCaps = est.peakCaps;
+  const nPeak = peakCaps.length;
+
+  const rand = mulberry32(SEED_MC);
+  const gauss = makeGauss(rand);
+  const drift = new Float64Array(nCand);
+  const sds = new Float64Array(nCand);
+  const fadeP = new Float64Array(nCand);
+
+  for (let r = 0; r < nReads; r++) {
+    const h = horizons[r];
+    const sqrtH = Math.sqrt(h);
+    const momSat = TAU_MOMENTUM_H * (1 - Math.exp(-h / TAU_MOMENTUM_H));
+    for (let i = 0; i < nCand; i++) {
+      drift[i] = mom[i] * momSat;
+      sds[i] = Math.min(sig[i] * sqrtH, 1);
+      fadeP[i] = clamp(evalSat(fadeCurve[i], h), 0, 0.95);
+    }
+    const gradP = 1 - Math.exp(-est.gradLambda * h);
+    const trend = clamp(est.trendG * h, -0.5, 0.8);
+    const lamNew = est.arrival * h;
+
+    for (let p = 0; p < N_PATHS; p++) {
+      let s0 = -Infinity;
+      let s1 = -Infinity;
+      let s2 = -Infinity;
+      let s3 = -Infinity;
+      let s4 = -Infinity;
+      let i0 = -1;
+      let i1 = -1;
+      let i2 = -1;
+      let i3 = -1;
+      let i4 = -1;
+
+      for (let i = 0; i < nCand; i++) {
+        let term = lastSize[i] + drift[i] + sds[i] * gauss();
+        if (isCurve[i] === 1) {
+          if (rand() < gradP) {
+            term = est.jumpMean + est.jumpSd * gauss();
+          } else if (term > CURVE_CEILING) {
+            term = CURVE_CEILING;
+          }
+        }
+        if (rand() < fadeP[i]) {
+          term = term - FADE_DROP_DEX + FADE_SD_DEX * gauss();
+        }
+        if (term > s4) {
+          if (term > s0) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = s0; i1 = i0; s0 = term; i0 = i;
+          } else if (term > s1) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = term; i1 = i;
+          } else if (term > s2) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = term; i2 = i;
+          } else if (term > s3) {
+            s4 = s3; i4 = i3; s3 = term; i3 = i;
+          } else {
+            s4 = term; i4 = i;
+          }
+        }
+      }
+
+      const nNew = Math.min(MAX_NEWCOMERS, poissonSample(rand, gauss, lamNew));
+      for (let j = 0; j < nNew; j++) {
+        let cap = peakCaps[(rand() * nPeak) | 0] + trend;
+        if (rand() < TAIL_PROB) cap += -TAIL_MEAN_DEX * Math.log(1 - rand());
+        if (cap > s4) {
+          if (cap > s0) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = s0; i1 = i0; s0 = cap; i0 = -1;
+          } else if (cap > s1) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = cap; i1 = -1;
+          } else if (cap > s2) {
+            s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = cap; i2 = -1;
+          } else if (cap > s3) {
+            s4 = s3; i4 = i3; s3 = cap; i3 = -1;
+          } else {
+            s4 = cap; i4 = -1;
+          }
+        }
+      }
+
+      const tops = [s0, s1, s2, s3, s4];
+      const idxs = [i0, i1, i2, i3, i4];
+      for (let k = 0; k < PLACES; k++) {
+        // A path with no coins at all (empty history, zero newcomers
+        // drawn) leaves this slot at -Infinity; it must not count as
+        // a newcomer win.
+        if (!Number.isFinite(tops[k])) continue;
+        sizeHist[k][binIndex(tops[k], edges)]++;
+        if (idxs[k] >= 0) orderCounts[k][idxs[k]]++;
+        else newcomerCounts[k]++;
+      }
+    }
+  }
+
+  return { orderCounts, newcomerCounts, sizeHist, totalSamples: N_PATHS * nReads };
+}
+
+/* ---------------------------------------------------------------- */
+/* Size distributions: anchor, blend, temper, v8 shift/widen         */
+/* ---------------------------------------------------------------- */
+
+// Per-place anchor: a normal centred on the last mark's place size
+// plus a through-origin drift (capped at +-0.5 dex), with spread from
+// the median absolute place-size increment, scaled by sqrt(horizon).
+function anchorDistribution(
+  marks: MarkData[],
+  place: number,
+  hbar: number,
+  edges: number[]
+): number[] {
+  const nBins = edges.length + 1;
+  const sizes: number[] = [];
+  const times: number[] = [];
+  for (const mark of marks) {
+    const row = mark.rows[place];
+    if (row) {
+      sizes.push(row.size);
+      times.push(mark.at);
+    }
+  }
+  let mean = 2.5;
+  let sd = 0.35;
+  if (sizes.length > 0) {
+    const lastCap = sizes[sizes.length - 1];
+    let drift = 0;
+    if (sizes.length >= 2) {
+      const t0 = times[0];
+      const s0 = sizes[0];
+      let num = 0;
+      let den = 0;
+      for (let i = 0; i < sizes.length; i++) {
+        const t = (times[i] - t0) / 3600e3;
+        num += t * (sizes[i] - s0);
+        den += t * t;
+      }
+      if (den > 0) drift = clamp((num / den) * hbar, -0.5, 0.5);
+    }
+    mean = lastCap + drift;
+    if (sizes.length >= 2) {
+      const incs: number[] = [];
+      for (let i = 1; i < sizes.length; i++) incs.push(Math.abs(sizes[i] - sizes[i - 1]));
+      sd = clamp((median(incs) / 0.6745) * Math.sqrt(hbar), 0.15, 0.6);
+    }
+  }
+  const out = new Array<number>(nBins).fill(0);
+  out[0] = normCdf((edges[0] - mean) / sd);
+  for (let b = 1; b < nBins - 1; b++) {
+    out[b] = normCdf((edges[b] - mean) / sd) - normCdf((edges[b - 1] - mean) / sd);
+  }
+  out[nBins - 1] = 1 - normCdf((edges[edges.length - 1] - mean) / sd);
+  renormalize(out);
+  return out;
+}
+
+function smoothDistribution(dist: number[]): number[] {
+  const n = dist.length;
+  const out = new Array<number>(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const v = dist[i];
+    if (v === 0) continue;
+    out[i] += 0.5 * v;
+    if (i > 0) out[i - 1] += 0.25 * v;
+    if (i < n - 1) out[i + 1] += 0.25 * v;
+  }
+  renormalize(out);
+  return out;
+}
+
+// Horizon-gated size widening and downward shift (v8 addition one).
+// Applied after the base size distribution is fully formed.
+function shiftAndWiden(dist: number[], edges: number[], hbar: number): number[] {
+  const n = dist.length;
+  const w = edges[1] - edges[0];
+  const centers: number[] = [];
+  centers.push(edges[0] - 0.25 * w);
+  for (let i = 1; i < n - 1; i++) centers.push((edges[i - 1] + edges[i]) / 2);
+  centers.push(edges[edges.length - 1] + 0.25 * w);
+
+  const shift = SHIFT_DEX * Math.min(hbar / SHIFT_HORIZON_H, 1);
+  const shifted = new Array<number>(n).fill(0);
+  for (let j = 0; j < n; j++) {
+    shifted[j] = interpAt(centers, dist, centers[j] + shift);
+  }
+  renormalize(shifted);
+
+  let out = shifted;
+  const sd = WIDEN_DEX * Math.sqrt(hbar / WIDEN_HORIZON_H);
+  if (sd > 1e-9) {
+    const k = Math.ceil((3 * sd) / w);
+    const kernel: number[] = [];
+    let ksum = 0;
+    for (let d = -k; d <= k; d++) {
+      const kv = Math.exp(-0.5 * Math.pow((d * w) / sd, 2));
+      kernel.push(kv);
+      ksum += kv;
+    }
+    for (let i = 0; i < kernel.length; i++) kernel[i] /= ksum;
+    const conv = new Array<number>(n).fill(0);
+    for (let j = 0; j < n; j++) {
+      let s = 0;
+      for (let d = -k; d <= k; d++) {
+        const src = j - d;
+        if (src >= 0 && src < n) s += shifted[src] * kernel[d + k];
+      }
+      conv[j] = s;
+    }
+    out = conv;
+    renormalize(out);
+  }
+
+  for (let j = 0; j < n; j++) out[j] = Math.max(out[j], PROB_FLOOR);
+  renormalize(out);
+  return out;
+}
+
+function buildSizeDistributions(
+  mc: McResult,
+  marks: MarkData[],
+  hbar: number,
+  edges: number[]
+): number[][] {
+  const nBins = edges.length + 1;
+  const alpha = 1 + TEMP_STRENGTH * Math.exp(-hbar / TEMP_TAU_H);
+  const dists: number[][] = [];
+  for (let k = 0; k < PLACES; k++) {
+    const mcDist = new Array<number>(nBins).fill(0);
+    for (let b = 0; b < nBins; b++) mcDist[b] = mc.sizeHist[k][b] / mc.totalSamples;
+    renormalize(mcDist);
+    // Effective-sample-size gate: diffuse Monte Carlo (mass spread
+    // over many bins) leans more on the conservative anchor, up to
+    // the cap; concentrated Monte Carlo leans less.
+    let sumSq = 0;
+    for (const p of mcDist) sumSq += p * p;
+    const ess = sumSq > 0 ? 1 / sumSq : 1;
+    const w = Math.min(SIZE_BLEND_MAX, ess / (ess + ESS_GATE_K));
+    const anchor = anchorDistribution(marks, k, hbar, edges);
+    const blended = new Array<number>(nBins).fill(0);
+    for (let b = 0; b < nBins; b++) blended[b] = (1 - w) * mcDist[b] + w * anchor[b];
+    let dist = smoothDistribution(blended);
+    for (let b = 0; b < nBins; b++) dist[b] = Math.pow(Math.max(dist[b], 0), alpha);
+    renormalize(dist);
+    for (let b = 0; b < nBins; b++) dist[b] = Math.max(dist[b], PROB_FLOOR);
+    renormalize(dist);
+    dist = shiftAndWiden(dist, edges, hbar);
+    dists.push(dist);
+  }
+  return dists;
+}
+
+/* ---------------------------------------------------------------- */
+/* Order probabilities: naming, then the v8 half-weight ensemble     */
+/* ---------------------------------------------------------------- */
+
+interface ProbEntry {
+  mint: string;
+  p: number;
+}
+
+// Keep the top entries, rescale to the target sum, floor, drop zeros.
+function finalizePlace(entries: ProbEntry[], targetSum: number): ProbEntry[] {
+  const sorted = [...entries].sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
+  const kept = sorted.slice(0, MAX_ROWS_PER_PLACE).filter((e) => e.p > 0);
   let sum = 0;
-  for (const c of cands) {
-    if (rows.length >= 100) break;
-    const unnamedCoins = Math.max(1, CHART_SIZE - rows.length);
-    const share = (1 - sum) / unnamedCoins;
-    if (c.q < share * 0.999) break;
-    const p = Math.floor(c.q * MICRO) / MICRO;
-    if (p <= 0) break;
-    rows.push({ mint: c.mint, p });
-    sum += p;
-    if (sum >= 1 - u) break;
+  for (const e of kept) sum += e.p;
+  if (sum <= 0) return [];
+  const scale = targetSum / sum;
+  const out: ProbEntry[] = [];
+  for (const e of kept) {
+    const p = Math.max(e.p * scale, PROB_FLOOR);
+    if (p > 0) out.push({ mint: e.mint, p });
   }
-  // If rounding/naming left the sum above 1 - u, trim the tail (keep unnamed mass honest).
-  while (sum > 1 - u + 1e-9 && rows.length > 0) { sum -= rows.pop()!.p; }
-  for (const r of rows) probabilities.push({ mint: r.mint, place: k, p: r.p });
+  let sum2 = 0;
+  for (const e of out) sum2 += e.p;
+  if (sum2 > 0) {
+    const scale2 = targetSum / sum2;
+    for (const e of out) e.p *= scale2;
+  }
+  return out.filter((e) => e.p > 0);
 }
 
-// ---------- emit sizes ----------
-// v5: the mixture weight is the order unnamed mass u (v1/v2 behaviour,
-// restored by patch P2), NOT the simulation's newcomer frequency. The lab
-// found mixing by u wins on splits (+0.33) and transfers positively on
-// synthetic long-horizon regimes, pulling size means down toward realised
-// levels — the field model extrapolates too high at long horizons, so
-// leaning on u (which the lag fit anchors) is the anti-extrapolation
-// direction. The place-normal blend is ESS-gated (patch P3): w(h) =
-// SIZE_BLEND_MAX * (1 - ESS(h)/ESS_TOT), where ESS(h) is the Gaussian-
-// kernel (0.5h bandwidth) effective sample size of lag evidence near
-// horizon h; the weight is averaged over the reads (W_BAR), so the
-// stationary anchor barely touches horizons with dense lag evidence and
-// carries full weight where the lag record is thin. The result is
-// kernel-smoothed one bin each way: Monte Carlo bin counts are noisy, and
-// smoothing trades a little peak sharpness for insurance against
-// off-by-one-bin misses, which the log score punishes asymmetrically.
-const ESS_TOT = (() => { let s = 0; for (const p of lagPts) { if (p.place >= 1) s += Math.exp(-((p.lag / 0.5) ** 2)); } return Math.max(1e-9, s); })();
-const blendW = (h: number): number => { let ess = 0; for (const p of lagPts) { if (p.place >= 1) ess += Math.exp(-(((p.lag - h) / 0.5) ** 2)); } return SIZE_BLEND_MAX * Math.min(1, Math.max(0, 1 - ess / ESS_TOT)); };
-const W_BAR = horizons.reduce((a, h) => a + blendW(h), 0) / Math.max(1, horizons.length);
-const sizes: Array<{ place: number; bin: number; p: number }> = [];
-for (let k = 1; k <= places; k++) {
-  const simNew = newcomerFreq[k - 1]! / totalSamples;
-  const knownN = Math.max(1, totalSamples - newcomerFreq[k - 1]!);
-  const newN = Math.max(1, newcomerFreq[k - 1]!);
-  const pn = new Array<number>(bins).fill(0);
-  for (const h of horizons) {
-    const b = placeNormalBins(k - 1, h);
-    for (let i = 0; i < bins; i++) pn[i]! += b[i]! / horizons.length;
+function buildBaseOrderProbs(
+  mc: McResult,
+  candidates: CoinFeatures[],
+  curves: LagCurves,
+  hbar: number
+): { probs: ProbEntry[][]; namedSum: number[] } {
+  const probs: ProbEntry[][] = [];
+  const namedSum: number[] = [];
+  for (let k = 0; k < PLACES; k++) {
+    const simNew = mc.newcomerCounts[k] / mc.totalSamples;
+    const direct = evalSat(curves.newcomer[k], hbar);
+    const unnamed = Math.min(UNNAMED_CAP, Math.max(direct, simNew));
+    const target = 1 - unnamed;
+    namedSum.push(target);
+    const rawNamed = 1 - simNew;
+    const scale = rawNamed > 0 ? target / rawNamed : 0;
+    const entries: ProbEntry[] = [];
+    if (scale > 0) {
+      for (let i = 0; i < candidates.length; i++) {
+        const f = mc.orderCounts[k][i] / mc.totalSamples;
+        if (f > 0) entries.push({ mint: candidates[i].mint, p: f * scale });
+      }
+    }
+    probs.push(finalizePlace(entries, target));
   }
-  const probs = new Array<number>(bins).fill(0);
-  const uW = uPlace[k - 1]!;
-  for (let b = 0; b < bins; b++) {
-    const pk = sizeHistKnown[k - 1]![b]! / knownN;
-    const pnw = simNew > 0 ? sizeHistNew[k - 1]![b]! / newN : 0;
-    const mix = (1 - uW) * pk + uW * pnw;
-    probs[b] = (1 - W_BAR) * mix + W_BAR * pn[b]!;
-  }
-  const sm = new Array<number>(bins).fill(0);
-  for (let b = 0; b < bins; b++) {
-    const lo = b > 0 ? probs[b - 1]! : 0;
-    const hi = b < bins - 1 ? probs[b + 1]! : 0;
-    sm[b] = SIZE_SMOOTH_KERNEL[0]! * lo + SIZE_SMOOTH_KERNEL[1]! * probs[b]! + SIZE_SMOOTH_KERNEL[2]! * hi;
-  }
-  const tot = sm.reduce((a, v) => a + v, 0);
-  // v6 Q2: horizon-mix-gated tempering. alpha ~1.13 on short-horizon
-  // read sets, ~1.001 at the final's 7-13h (effectively off). The
-  // gate uses the MEAN horizon because the schema emits one size
-  // distribution per place for all reads; see header + BUILD_LOG.md.
-  const TEMP_ALPHA = 1 + 0.15 * Math.exp(-(horizons.reduce((a, h) => a + h, 0) / Math.max(1, horizons.length)) / 2.0);
-  const rawProbs = tot > 0 ? sm.map((v) => v / tot) : sm;
-  const tp = rawProbs.map((v) => Math.pow(Math.max(v, 1e-12), TEMP_ALPHA));
-  const tpsum = tp.reduce((a, v) => a + v, 0);
-  const finalProbs = tpsum > 0 ? tp.map((v) => v / tpsum) : rawProbs;
-  for (let b = 0; b < bins; b++) {
-    const p = Math.floor(finalProbs[b]! * MICRO) / MICRO;
-    if (p > 0) sizes.push({ place: k, bin: b, p });
-  }
+  return { probs, namedSum };
 }
 
-// ---------- top5: assignment maximising expected agreement ----------
-const totals = new Map<string, number>();
-for (let k = 1; k <= places; k++) for (const [mint, n] of placeFreq[k - 1]!) totals.set(mint, (totals.get(mint) ?? 0) + n);
-const pool = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([m]) => m);
-const probAt = (mint: string, place: number): number => (placeFreq[place - 1]!.get(mint) ?? 0) / totalSamples;
-let bestAssign: string[] = pool.slice(0, places);
-let bestScore = -Infinity;
-function permute(prefix: string[], rest: string[]): void {
-  if (prefix.length === places) {
-    let s = 0;
-    for (let a = 0; a < places; a++) for (let k = 1; k <= places; k++) s += probAt(prefix[a]!, k) * (places - Math.abs(a - (k - 1)));
-    if (s > bestScore) { bestScore = s; bestAssign = [...prefix]; }
-    return;
+// Gumbel-top-5 sampling: each draw adds independent Gumbel noise to
+// the log strengths and takes the top five; place frequencies over
+// the draws are the model's per-place probabilities.
+function sampleOrderModel(logStrength: number[], draws: number, rand: () => number): number[][] {
+  const n = logStrength.length;
+  const counts: number[][] = Array.from({ length: PLACES }, () => new Array<number>(n).fill(0));
+  for (let d = 0; d < draws; d++) {
+    let s0 = -Infinity;
+    let s1 = -Infinity;
+    let s2 = -Infinity;
+    let s3 = -Infinity;
+    let s4 = -Infinity;
+    let i0 = -1;
+    let i1 = -1;
+    let i2 = -1;
+    let i3 = -1;
+    let i4 = -1;
+    for (let i = 0; i < n; i++) {
+      let u = rand();
+      if (u <= 0) u = 1e-12;
+      if (u >= 1) u = 1 - 1e-12;
+      const v = logStrength[i] - Math.log(-Math.log(u));
+      if (v > s4) {
+        if (v > s0) {
+          s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = s0; i1 = i0; s0 = v; i0 = i;
+        } else if (v > s1) {
+          s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = s1; i2 = i1; s1 = v; i1 = i;
+        } else if (v > s2) {
+          s4 = s3; i4 = i3; s3 = s2; i3 = i2; s2 = v; i2 = i;
+        } else if (v > s3) {
+          s4 = s3; i4 = i3; s3 = v; i3 = i;
+        } else {
+          s4 = v; i4 = i;
+        }
+      }
+    }
+    const idxs = [i0, i1, i2, i3, i4];
+    for (let k = 0; k < PLACES; k++) {
+      if (idxs[k] >= 0) counts[k][idxs[k]]++;
+    }
   }
-  for (let i = 0; i < rest.length; i++) permute([...prefix, rest[i]!], [...rest.slice(0, i), ...rest.slice(i + 1)]);
+  for (let k = 0; k < PLACES; k++) {
+    for (let i = 0; i < n; i++) counts[k][i] /= draws;
+  }
+  return counts;
 }
-if (pool.length >= places) permute([], pool);
-const top5 = bestAssign.length === places ? bestAssign : candidates.slice(0, places).map((c) => c.mint);
 
-writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5, sizes })}\n`);
+function buildEnsembleOrderProbs(
+  features: CoinFeatures[],
+  base: { probs: ProbEntry[][]; namedSum: number[] }
+): ProbEntry[][] {
+  const ranked = [...features].sort((a, b) => b.lastSize - a.lastSize).slice(0, MAX_CANDIDATES);
+  const n = ranked.length;
+  if (n === 0) return base.probs;
+
+  const logLuce: number[] = new Array(n);
+  const logClf: number[] = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const c = ranked[i];
+    logLuce[i] = 1.5 * (c.lastSize - 2.2);
+    let score = 1.2 * (c.lastSize - 2.2) + 2 * c.momentum;
+    if (c.lastVenue === "pool") score += 0.4;
+    score -= 0.5 * Math.log10(c.ageHours + 0.25);
+    if (c.lastVenue === "curve") score += 0.3 * Math.log10(c.lastReservesSol + 1);
+    logClf[i] = clamp(score, -20, 20);
+  }
+
+  const rand = mulberry32(SEED_ENSEMBLE);
+  const luce = sampleOrderModel(logLuce, GUMBEL_DRAWS, rand);
+  const clf = sampleOrderModel(logClf, GUMBEL_DRAWS, rand);
+
+  const blended: ProbEntry[][] = [];
+  for (let k = 0; k < PLACES; k++) {
+    const target = base.namedSum[k];
+    // Scale each small model to the base model's named sum, keeping
+    // the unnamed mass exactly.
+    const luceMap = new Map<string, number>();
+    const clfMap = new Map<string, number>();
+    let luceSum = 0;
+    let clfSum = 0;
+    for (let i = 0; i < n; i++) {
+      luceSum += luce[k][i];
+      clfSum += clf[k][i];
+    }
+    for (let i = 0; i < n; i++) {
+      if (luce[k][i] > 0 && luceSum > 0) luceMap.set(ranked[i].mint, (luce[k][i] / luceSum) * target);
+      if (clf[k][i] > 0 && clfSum > 0) clfMap.set(ranked[i].mint, (clf[k][i] / clfSum) * target);
+    }
+    const baseMap = new Map<string, number>();
+    for (const e of base.probs[k]) baseMap.set(e.mint, e.p);
+    const mints = new Set<string>([...baseMap.keys(), ...luceMap.keys(), ...clfMap.keys()]);
+    const entries: ProbEntry[] = [];
+    for (const mint of mints) {
+      const p =
+        0.5 * (baseMap.get(mint) || 0) +
+        0.25 * (luceMap.get(mint) || 0) +
+        0.25 * (clfMap.get(mint) || 0);
+      if (p > 0) entries.push({ mint, p });
+    }
+    blended.push(finalizePlace(entries, target));
+  }
+  return blended;
+}
+
+/* ---------------------------------------------------------------- */
+/* Forecast assembly                                                 */
+/* ---------------------------------------------------------------- */
+
+interface ForecastRow {
+  mint: string;
+  place: number;
+  p: number;
+}
+
+interface SizeRow {
+  place: number;
+  bin: number;
+  p: number;
+}
+
+interface Forecast {
+  probabilities: ForecastRow[];
+  top5: string[];
+  sizes: SizeRow[];
+}
+
+function buildForecast(marks: MarkData[], task: TaskData): Forecast {
+  const lastMark = marks[marks.length - 1];
+  const lastMarkAt = lastMark.at;
+  const horizons = task.reads.map((r) => Math.max(0, (r - lastMarkAt) / 3600e3));
+  const hbar = horizons.length > 0 ? horizons.reduce((a, b) => a + b, 0) / horizons.length : 0;
+
+  const byMint = buildCoinHistories(marks);
+  const features = buildFeatures(byMint, lastMarkAt);
+  const curves = fitLagCurves(marks, byMint);
+  const est = estimateQuantities(marks, features, byMint, task.cadenceMinutes);
+  const candidates = selectCandidates(features);
+
+  const mc = runMonteCarlo(candidates, est, curves, horizons, task.edges);
+  const sizeDists = buildSizeDistributions(mc, marks, hbar, task.edges);
+  const base = buildBaseOrderProbs(mc, candidates, curves, hbar);
+  const orderProbs = buildEnsembleOrderProbs(features, base);
+
+  const probabilities: ForecastRow[] = [];
+  for (let k = 0; k < PLACES; k++) {
+    const rows = [...orderProbs[k]].sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
+    for (const e of rows) {
+      const p = floor6(e.p);
+      if (p > 0) probabilities.push({ mint: e.mint, place: k + 1, p });
+    }
+  }
+
+  const sizes: SizeRow[] = [];
+  for (let k = 0; k < PLACES; k++) {
+    for (let b = 0; b < sizeDists[k].length; b++) {
+      const p = floor6(sizeDists[k][b]);
+      if (p > 0) sizes.push({ place: k + 1, bin: b, p });
+    }
+  }
+
+  // Top 5 from the blended first-place probabilities, highest first,
+  // padded with the largest coins if fewer than five are named.
+  const top5: string[] = [];
+  const used = new Set<string>();
+  const place1 = [...orderProbs[0]].sort((a, b) => b.p - a.p || (a.mint < b.mint ? -1 : 1));
+  for (const e of place1) {
+    if (top5.length >= PLACES) break;
+    top5.push(e.mint);
+    used.add(e.mint);
+  }
+  if (top5.length < PLACES) {
+    const bySize = [...features].sort((a, b) => b.lastSize - a.lastSize);
+    for (const c of bySize) {
+      if (top5.length >= PLACES) break;
+      if (!used.has(c.mint)) {
+        top5.push(c.mint);
+        used.add(c.mint);
+      }
+    }
+  }
+  const placeholders = [
+    "11111111111111111111111111111111",
+    "22222222222222222222222222222222",
+    "33333333333333333333333333333333",
+    "44444444444444444444444444444444",
+    "55555555555555555555555555555555",
+  ];
+  for (let i = 0; top5.length < PLACES; i++) top5.push(placeholders[i]);
+
+  return { probabilities, top5, sizes };
+}
+
+// Even-spread fallback: used only when the history is empty or the
+// model throws, so a readable forecast is always written.
+function fallbackForecast(marks: MarkData[], task: TaskData): Forecast {
+  const sizes: SizeRow[] = [];
+  const nBins = task.edges.length + 1;
+  const p = floor6(1 / nBins);
+  for (let k = 0; k < PLACES; k++) {
+    for (let b = 0; b < nBins; b++) {
+      if (p > 0) sizes.push({ place: k + 1, bin: b, p });
+    }
+  }
+  const top5: string[] = [];
+  if (marks.length > 0) {
+    for (const row of marks[marks.length - 1].rows.slice(0, PLACES)) top5.push(row.mint);
+  }
+  const placeholders = [
+    "11111111111111111111111111111111",
+    "22222222222222222222222222222222",
+    "33333333333333333333333333333333",
+    "44444444444444444444444444444444",
+    "55555555555555555555555555555555",
+  ];
+  for (let i = 0; top5.length < PLACES; i++) top5.push(placeholders[i]);
+  return { probabilities: [], top5, sizes };
+}
+
+/* ---------------------------------------------------------------- */
+/* Entry point                                                       */
+/* ---------------------------------------------------------------- */
+
+function main(): void {
+  const inputDir = process.env.MAKEFUN_INPUT_DIR || "/input";
+  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+  const task = parseTask(JSON.parse(fs.readFileSync(path.join(inputDir, "task.json"), "utf8")));
+  const marks = parseMarks(fs.readFileSync(path.join(inputDir, "history.ndjson"), "utf8"));
+  let forecast: Forecast;
+  try {
+    forecast =
+      marks.length === 0 ? fallbackForecast(marks, task) : buildForecast(marks, task);
+  } catch (err) {
+    console.error("model failed, writing fallback forecast:", err);
+    forecast = fallbackForecast(marks, task);
+  }
+  fs.mkdirSync(outputDir, { recursive: true });
+  fs.writeFileSync(path.join(outputDir, "forecast.json"), JSON.stringify(forecast));
+}
+
+main();
