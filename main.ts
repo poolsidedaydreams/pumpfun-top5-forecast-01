@@ -1,73 +1,81 @@
-// pumpfun-top5-forecast-01, entry v4 (Node 22, standard library only).
+// pumpfun-top5-forecast-01, entry v5 (Node 22, standard library only).
 // No network, no API keys, no model calls; fully deterministic (fixed seed).
 //
-// The same Monte Carlo machinery as v1/v2/v3 (per-coin log-cap paths with
-// momentum saturation, fade hazard, graduation jumps, plus a synthetic
-// newcomer field whose count scales with the horizon), with five changes
-// on top of v3, each isolated by paired ablation on the validated scorer
-// (see BUILD_LOG.md for the full diagnosis, every ablation, and the honest
-// statistical limits). In short:
+// v5 = v3 + three targeted patches (see BUILD_LOG.md for the full record,
+// the ablation evidence, and the honest risks). v5 is deliberately built
+// on the v3 basis, NOT on v4: v4 scored worse than v3 on the practice
+// server (-39.55 vs -37.31) despite a much better local score, and the
+// v5 ablation lab isolated the damage to v4's pool-only newcomer cap.
+// The three patches, all verified in the lab from the v3 basis:
 //
-//   1. THE ARRIVAL-RATE SPAN IS FIXED (an estimator bug, not tuning).
-//      v1/v2/v3 computed the top-20-entrant rate as entrants / span, where
-//      span was the first-to-last gap of the recent marks — or a 1-hour
-//      fallback when only one recent mark existed. Entrants first seen on
-//      the first recent mark arrived during the interval BEFORE it, so the
-//      window is one cadence too short; on thin histories the fallback
-//      understated the rate 4-6x (15/h instead of ~90/h, capped at 60).
-//      v4 adds one median inter-mark gap (the cadence) to the span, and
-//      uses the cadence itself when there is a single recent mark. The
-//      divisor floor (0.25h) and the 60/h cap are unchanged.
-//   2. NEWCOMER CAPS COME FROM POOL-ONLY YOUNG OBSERVATIONS. Every
-//      realised newcomer-held top-5 slot in the rehearsal history was a
-//      pool graduate holding 3.10-3.56, while the v1/v2/v3 mixed
-//      distribution was 81% curve observations (never above 2.52) and
-//      thinned the 2nd-5th order statistics of the newcomer field. v4
-//      draws newcomer caps from young (<1h) pool/migrating observations
-//      of coins that reached the top 20, falling back to the mixed
-//      distribution when no pool observation exists. The heavy-tail
-//      extension (15% chance, exponential scale 0.25) is unchanged.
-//      Honest caveat: the split gain leans on few pool observations on
-//      thin cuts (4 at cut 2) — see BUILD_LOG.md for the haircut.
-//   3. THE SIZE MIXTURE WEIGHT IS u AGAIN (reverting v3 change #3).
-//      v3 mixed the known/newcomer size histograms by the simulation's
-//      own newcomer frequency simNew, on a double-counting rationale the
-//      numbers did not support: weighting by the order unnamed mass u
-//      beat simNew on the weak-field base (+0.34) and was neutral on the
-//      strong-field base, and no tested regime favoured simNew.
-//   4. THE SIZE MIXTURE'S UPPER TAIL IS A SHRUNK GPD SPLICE. Above the
-//      90th percentile of each place's MC size mixture, bin masses are
-//      replaced by a generalised-Pareto survival fit on SOL-scale
-//      exceedances: shape via the Hill estimator shrunk 50% toward the
-//      exponential (gamma = 0), scale from the mean excess, total tail
-//      mass preserved. Gamma is never hard-coded; a degenerate fit falls
-//      back to exponential. (Adapted from the GPD/Hill mathematics of
-//      heavytails (MIT) and the splice idea of skaters (MIT); both
-//      reimplemented from the formulas — see BUILD_LOG.md.)
-//   5. HALF THE SIMULATIONS USE OU (MEAN-REVERTING) PATHS. Alternating
-//      sims draw known-coin paths from an Ornstein-Uhlenbeck family
-//      (kappa = 0.1/h, reversion to the coin's own historical mean cap,
-//      exact OU multi-step mean/variance) instead of the momentum-
-//      saturation family; fade, graduation, trend shift, and the curve
-//      ceiling apply unchanged. At short horizons OU is nearly
-//      identical to the base family (phi -> 1), so the ensemble is
-//      self-gating; at long horizons it is anti-extrapolation insurance
-//      against the +1.6-decade size extrapolation. (OU family from
-//      skaters (MIT), reimplemented from the formulas.)
+//   P1. ARRIVAL SPAN + CADENCE (bug fix). The arrival-rate span now adds
+//       the median inter-mark gap (cadence) to the first-to-last span of
+//       the recent window, and a single mark uses the cadence instead of
+//       a flat 1 hour. The 0.25h floor and 60/h cap are unchanged. The
+//       local +1.22 nats this showed is a thin-cut artefact (cut 2 only);
+//       on the full 66-mark history its effect is ~0. Do not claim it
+//       as a final-horizon gain.
+//   P2. SIZE MIXTURE WEIGHT = u. Sizes mix the known/newcomer histograms
+//       by the order unnamed mass u (as v1/v2 did) instead of the
+//       simulation's own newcomer frequency. In the lab this moves the
+//       long-horizon size means DOWN toward realised levels (an
+//       anti-extrapolation direction) and wins +0.33 locally.
+//   P3. ESS-GATED BLEND WEIGHT w(h). The horizon-gated blend weight is
+//       now driven by the effective sample size of lag evidence near
+//       each horizon (Gaussian kernel, 0.5h bandwidth, over lag points):
+//       where lag evidence is dense the anchor weight drops toward 0,
+//       where it is thin the full SIZE_BLEND_MAX applies. SIZE_BLEND_MAX
+//       (0.3) is unchanged; the old rational form and its half-saturation
+//       constant are superseded (SIZE_BLEND_HALF_H is retained unused).
 //
-// REJECTED BY THE LONG-HORIZON GATE (see BUILD_LOG.md §4.2): a floored
-// log-pool in place of the linear size blend won +0.14 on splits but
-// collapsed long-horizon size SDs by ~half (bins 82 -> 35) — it is NOT
-// in this file. KDE smoothing, antithetic shocks, birth-cap spikes,
-// and graduation-mean shrinkage also failed ablation and are absent.
+// Everything else is v3 verbatim: the same Monte Carlo machinery
+// (per-coin log-cap paths with momentum saturation, fade hazard,
+// graduation jumps, plus a synthetic newcomer field whose count scales
+// with the horizon and whose caps come from the history's young top-20
+// coins), with v3's six repairs. In short, v2's split deficit was
+// traced to three interacting defects:
 //
-// Everything else is v3 verbatim: the repaired newcomer lag fit, sparse-mark
-// exclusion, the horizon-gated size blend, kernel smoothing, the
-// pooled record trend (min 2 marks), greedy naming, 40,000 sims, seed
-// 0x9e3779b9, NEWCOMER_CAP 200, ARRIVAL_CAP 60, u = max(direct, simNew),
-// and — most importantly — the FADE fit, kept byte-for-byte v1/v2,
-// because ablating a repaired fade fit cost 4.4 nats: lag "fade" events
-// are mostly rank churn and recorder sampling artefacts, not deaths.
+//   1. THE LAG FIT COULD NOT REPRESENT FAST TURNOVER. fitSaturating's grid
+//      floored tau at 0.5h and capped fInf at 0.8, discarded buckets with
+//      fewer than 8 points, and shrank toward a slow prior (0.5, 2h). The
+//      history's own lag buckets show 60-90% of top-5 slots turning over
+//      within 10-30 minutes, yet the fitted curve predicted 4-10% at those
+//      lags. v1 survived only because its over-drawn newcomer field inflated
+//      the simulated newcomer frequency, which the max() in the unnamed-mass
+//      rule mistook for the fit. v2's correct horizon-scaled count removed
+//      that accidental compensation without repairing the fit, so the
+//      unnamed mass collapsed exactly on newcomer-held slots. v3 repairs
+//      the NEWCOMER fit only (wider grid, count-weighted buckets, a
+//      single-bucket fallback, a faster prior); the FADE fit is kept
+//      byte-for-byte v1/v2, because ablating a repaired fade fit cost
+//      1.7 nats: lag "fade" events are mostly rank churn and recorder
+//      sampling artefacts, not deaths to the tail floor.
+//   2. SIZES DOUBLE-COUNTED THE FIT. The size mixture weighted the
+//      newcomer-holder histogram by the order unnamed mass u, but u and
+//      the simulated newcomer frequency disagree exactly when the field
+//      is thin, and the newcomer conditional histogram is then a biased,
+//      noisy sample. Sizes score the MARGINAL place-cap distribution, so
+//      v3 mixes by the simulation's own newcomer frequency and lets the
+//      field model speak for the marginal. (v5 P2 revisits this: the lab
+//      found mixing by u wins on splits and transfers positively on
+//      synthetic long-horizon regimes, because it pulls size means down
+//      toward realised levels. The disagreement between the two weightings
+//      is itself evidence the field model extrapolates too high.)
+//   3. THE SIZE BLEND WAS HORIZON-BLIND. Blending 25% of a stationary
+//      place normal helps at 7-13h (where the simulation extrapolates)
+//      but drags sizes down and thins them at short horizons in a rising
+//      regime. v3 gates the blend weight by horizon: ~0.02-0.06 at
+//      sub-hour horizons, ~0.24 at the final's 7-13h. (v5 P3 replaces
+//      the rational gate with an ESS gate keyed to lag evidence.)
+//
+// The remaining v3 changes: sparse marks (<10 rows) are excluded from lag
+// pairs (an empty mark cannot define "seen"); the size histogram is kernel
+// smoothed one bin each way (Monte Carlo histograms are noisy and the log
+// score punishes near-zero bins asymmetrically); the record trend is fitted
+// to the top-5 mean level instead of the single noisiest series (place 1),
+// with the same shrinkage and caps. All parameters are estimated from the
+// history given; nothing is hard-coded to the rehearsal. All horizons and
+// times are read from task.json.
 //
 // Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else /output).
 
@@ -87,7 +95,7 @@ const NEWCOMER_CAP = 200;
 const PLACE_PRIOR_WEIGHT = 30;
 /** Ceiling of the horizon-gated size-blend weight (reached at long horizons). */
 const SIZE_BLEND_MAX = 0.3;
-/** Half-saturation horizon (hours) of the size-blend weight. */
+/** Half-saturation horizon (hours) of the size-blend weight (v3 rational gate; superseded by the v5 ESS gate, retained unused). */
 const SIZE_BLEND_HALF_H = 2;
 /** Kernel smoothing the per-place size histogram (must sum to 1). */
 const SIZE_SMOOTH_KERNEL = [0.25, 0.5, 0.25];
@@ -356,31 +364,15 @@ const gradCapsFiltered = gradCaps.filter((x) => x > 2.3 && x < 4.5);
 const gradCap = meanSd(gradCapsFiltered.length ? gradCapsFiltered : [2.9]);
 const GRAD_MEAN = gradCapsFiltered.length >= 3 ? gradCap.mean : 2.9;
 const GRAD_SD = gradCapsFiltered.length >= 3 ? Math.min(0.6, Math.max(0.2, gradCap.sd)) : 0.4;
-// Newcomer caps (v4): POOL-ONLY observations of coins that reached the top
-// 20, while younger than 1h — the cap a hot arrival actually holds at a
-// random young age, restricted to the venue every realised newcomer-held
-// top-5 slot occupied. The v1/v2/v3 mixed distribution was 81% curve
-// observations capped at ~2.52, which thinned the newcomer field's 2nd-5th
-// order statistics; the pool-only distribution matches the realised
-// newcomer-held caps (3.10-3.56). When the history holds no young pool
-// observation at all, fall back to the mixed distribution so the field
-// never draws from an empty set.
+// Newcomer caps: observations of coins that reached the top 20, while younger
+// than 1h — the cap a hot arrival actually holds at a random young age.
 // (Matched to the arrival rate, which counts top-20 entrants.)
 const peakCaps: number[] = [];
 for (const c of coinList) {
   if (!c.obs.some((o) => o.rank <= 20)) continue;
   for (const o of c.obs) {
     const age = (o.t - c.created) / HOUR;
-    if (age >= 0 && age < 1 && (o.venue === 'pool' || o.venue === 'migrating')) peakCaps.push(o.x);
-  }
-}
-if (peakCaps.length === 0) {
-  for (const c of coinList) {
-    if (!c.obs.some((o) => o.rank <= 20)) continue;
-    for (const o of c.obs) {
-      const age = (o.t - c.created) / HOUR;
-      if (age >= 0 && age < 1) peakCaps.push(o.x);
-    }
+    if (age >= 0 && age < 1) peakCaps.push(o.x);
   }
 }
 peakCaps.sort((a, b) => a - b);
@@ -392,15 +384,12 @@ function sampleNewcomerCap(): number {
   return base;
 }
 // Arrival rate: coins first seen in a top-20, per hour, recent half of marks.
-// v4 span fix: the arrival window for entrants first seen on a recent mark
-// includes the interval BEFORE the first recent mark (they arrived during
-// it), so the span is the first-to-last recent gap PLUS one median
-// inter-mark gap (the cadence); with a single recent mark the span IS the
-// cadence. v1/v2/v3 used the bare gap — or a 1-hour fallback for a single
-// recent mark — understating the rate up to 6x on thin histories.
+// (v5: nonEmptyMarks is computed once and shared with the trend block below;
+// the two v3 blocks computed the identical list independently.)
+const nonEmptyMarks = marks.map((m, i) => i).filter((i) => marks[i]!.rows!.length > 0);
 let entrants = 0, spanH = 0;
 {
-  const nonEmpty = marks.map((m, i) => i).filter((i) => marks[i]!.rows!.length > 0);
+  const nonEmpty = nonEmptyMarks;
   const recent = nonEmpty.slice(Math.floor(nonEmpty.length / 2));
   const seenBefore = new Set<string>();
   for (const i of nonEmpty) {
@@ -409,6 +398,10 @@ let entrants = 0, spanH = 0;
       seenBefore.add(r.mint);
     }
   }
+  // v5 P1: the span covers first-to-last PLUS one cadence (the median
+  // inter-mark gap), because the first-to-last span alone understates the
+  // window over which entrants were counted; a single mark uses the
+  // cadence instead of a flat 1 hour.
   {
     const gaps: number[] = [];
     for (let gi = 1; gi < tMark.length; gi++) { const g = (tMark[gi]! - tMark[gi - 1]!) / HOUR; if (g > 0) gaps.push(g); }
@@ -427,7 +420,7 @@ const ARRIVAL_PER_H = Math.min(60, Math.max(2, entrants / Math.max(spanH, 0.25))
 // asserting no trend at all, and the caps below bound the damage.
 let trendG = 0;
 {
-  const nonEmpty = marks.map((m, i) => i).filter((i) => marks[i]!.rows!.length > 0);
+  const nonEmpty = nonEmptyMarks;
   const take = Math.max(3, Math.ceil(nonEmpty.length / 2));
   const recent = nonEmpty.slice(-take);
   if (recent.length >= 2) {
@@ -469,7 +462,7 @@ candidates = candidates.slice(0, MAX_CANDIDATES);
 const TAU_MOMENTUM = 2.0;
 const SIGMA_MAX = 1.0;
 const CURVE_CEILING = 2.55;
-interface Prep { mint: string; x0: number; drift: number; sigmaH: number; curve: boolean; mu: number; }
+interface Prep { mint: string; x0: number; drift: number; sigmaH: number; curve: boolean; }
 const prepped: Prep[] = candidates.map((c) => {
   const o = c.obs;
   let slope = 0;
@@ -480,7 +473,7 @@ const prepped: Prep[] = candidates.map((c) => {
   const prior = c.lastVenue === 'curve' ? 0 : POOL_DRIFT;
   const w = Math.min(0.7, o.length / (o.length + 3));
   return {
-    mint: c.mint, x0: c.lastX, mu: o.reduce((a, ob) => a + ob.x, 0) / Math.max(1, o.length),
+    mint: c.mint, x0: c.lastX,
     drift: Math.min(1.2, Math.max(-1.2, w * slope + (1 - w) * prior)),
     sigmaH: c.lastVenue === 'curve' ? CURVE_SIGMA_H : POOL_SIGMA_H,
     curve: c.lastVenue === 'curve',
@@ -569,27 +562,16 @@ const binOfX = (x: number): number => { let b = 0; while (b < edges.length && ed
 function sampleCoin(p: Prep, h: number): number {
   if (rnd() < fadeProbAt(h)) return 1.45 + 0.25 * randn();
   if (p.curve && rnd() < 1 - Math.exp(-gradRate * h)) return GRAD_MEAN + GRAD_SD * randn() + trendShift(h);
-  let mean: number;
-  let sd: number;
-  if (OU_ON) {
-    const KAPPA = 0.1;
-    const phi = Math.exp(-KAPPA * h);
-    mean = p.mu + (p.x0 - p.mu) * phi + trendShift(h);
-    sd = Math.min(SIGMA_MAX, p.sigmaH * Math.sqrt((1 - Math.exp(-2 * KAPPA * h)) / (2 * KAPPA)));
-  } else {
-    mean = p.x0 + p.drift * TAU_MOMENTUM * (1 - Math.exp(-h / TAU_MOMENTUM)) + trendShift(h);
-    sd = Math.min(SIGMA_MAX, p.sigmaH * Math.sqrt(Math.max(h, 0.02)));
-  }
+  const mean = p.x0 + p.drift * TAU_MOMENTUM * (1 - Math.exp(-h / TAU_MOMENTUM)) + trendShift(h);
+  const sd = Math.min(SIGMA_MAX, p.sigmaH * Math.sqrt(Math.max(h, 0.02)));
   let x = mean + sd * randn();
   if (p.curve) x = Math.min(x, CURVE_CEILING);
   return x;
 }
 
-let OU_ON = false;
 const nPrep = prepped.length;
 const caps = new Float64Array(nPrep);
 for (let s = 0; s < SIMS; s++) {
-  OU_ON = s % 2 === 1;
   for (let ri = 0; ri < horizons.length; ri++) {
     const h = horizons[ri]!;
     for (let i = 0; i < nPrep; i++) caps[i] = sampleCoin(prepped[i]!, h);
@@ -655,30 +637,27 @@ for (let k = 1; k <= places; k++) {
 }
 
 // ---------- emit sizes ----------
-// v4: the mixture weight is the order unnamed mass u again (v1/v2), NOT
-// the simulation's own newcomer frequency simNew (v3). v3's decoupling
-// rationale (reweighting by u double-counts the lag fit) was not
-// supported by the numbers: weighting by u beat simNew on the weak-field
-// base and was neutral on the strong-field base, and no tested regime
-// favoured simNew. The place-normal blend is horizon-gated: w(h) =
-// SIZE_BLEND_MAX * h / (h + HALF), averaged over the reads, so the
-// stationary anchor barely touches short-horizon forecasts and carries
-// ~0.24 weight at the final's 7-13h. The result is kernel-smoothed one
-// bin each way: Monte Carlo bin counts are noisy, and smoothing trades
-// a little peak sharpness for insurance against off-by-one-bin misses,
-// which the log score punishes asymmetrically.
-const blendW = (h: number): number => SIZE_BLEND_MAX * h / (h + SIZE_BLEND_HALF_H);
+// v5: the mixture weight is the order unnamed mass u (v1/v2 behaviour,
+// restored by patch P2), NOT the simulation's newcomer frequency. The lab
+// found mixing by u wins on splits (+0.33) and transfers positively on
+// synthetic long-horizon regimes, pulling size means down toward realised
+// levels — the field model extrapolates too high at long horizons, so
+// leaning on u (which the lag fit anchors) is the anti-extrapolation
+// direction. The place-normal blend is ESS-gated (patch P3): w(h) =
+// SIZE_BLEND_MAX * (1 - ESS(h)/ESS_TOT), where ESS(h) is the Gaussian-
+// kernel (0.5h bandwidth) effective sample size of lag evidence near
+// horizon h; the weight is averaged over the reads (W_BAR), so the
+// stationary anchor barely touches horizons with dense lag evidence and
+// carries full weight where the lag record is thin. The result is
+// kernel-smoothed one bin each way: Monte Carlo bin counts are noisy, and
+// smoothing trades a little peak sharpness for insurance against
+// off-by-one-bin misses, which the log score punishes asymmetrically.
+const ESS_TOT = (() => { let s = 0; for (const p of lagPts) { if (p.place >= 1) s += Math.exp(-((p.lag / 0.5) ** 2)); } return Math.max(1e-9, s); })();
+const blendW = (h: number): number => { let ess = 0; for (const p of lagPts) { if (p.place >= 1) ess += Math.exp(-(((p.lag - h) / 0.5) ** 2)); } return SIZE_BLEND_MAX * Math.min(1, Math.max(0, 1 - ess / ESS_TOT)); };
 const W_BAR = horizons.reduce((a, h) => a + blendW(h), 0) / Math.max(1, horizons.length);
-const binCentres = (() => {
-  const d = edges.length >= 2 ? edges[1]! - edges[0]! : 0.05;
-  const c: number[] = [];
-  for (let b = 0; b < bins; b++) c.push(b === 0 ? edges[0]! - d / 2 : b === edges.length ? edges[edges.length - 1]! + d / 2 : (edges[b - 1]! + edges[b]!) / 2);
-  return c;
-})();
 const sizes: Array<{ place: number; bin: number; p: number }> = [];
 for (let k = 1; k <= places; k++) {
   const simNew = newcomerFreq[k - 1]! / totalSamples;
-  const uW = uPlace[k - 1]!;
   const knownN = Math.max(1, totalSamples - newcomerFreq[k - 1]!);
   const newN = Math.max(1, newcomerFreq[k - 1]!);
   const pn = new Array<number>(bins).fill(0);
@@ -686,49 +665,14 @@ for (let k = 1; k <= places; k++) {
     const b = placeNormalBins(k - 1, h);
     for (let i = 0; i < bins; i++) pn[i]! += b[i]! / horizons.length;
   }
-  const mixArr = new Array<number>(bins).fill(0);
+  const probs = new Array<number>(bins).fill(0);
+  const uW = uPlace[k - 1]!;
   for (let b = 0; b < bins; b++) {
     const pk = sizeHistKnown[k - 1]![b]! / knownN;
     const pnw = simNew > 0 ? sizeHistNew[k - 1]![b]! / newN : 0;
-    mixArr[b] = (1 - uW) * pk + uW * pnw;
+    const mix = (1 - uW) * pk + uW * pnw;
+    probs[b] = (1 - W_BAR) * mix + W_BAR * pn[b]!;
   }
-  // GPD splice on the MC mixture's upper tail (per place): threshold at the
-  // 90th percentile of the mixture CDF; tail shape via Hill on SOL-scale
-  // exceedances, shrunk 50% toward exponential; scale from mean excess.
-  {
-    let cum = 0, uBin = bins - 1;
-    for (let b = 0; b < bins; b++) { cum += mixArr[b]!; if (cum >= 0.9) { uBin = b; break; } }
-    const uSol = Math.pow(10, binCentres[uBin]!);
-    let wSum = 0, meanEx = 0, hillSum = 0;
-    for (let b = uBin + 1; b < bins; b++) {
-      const wgt = mixArr[b]!;
-      if (wgt <= 0) continue;
-      const xSol = Math.pow(10, binCentres[b]!);
-      const ex = xSol - uSol;
-      if (ex <= 0) continue;
-      wSum += wgt; meanEx += wgt * ex; hillSum += wgt * Math.log(xSol / uSol);
-    }
-    if (wSum > 1e-9 && meanEx > 0) {
-      meanEx /= wSum;
-      let gamma = 0.5 * (hillSum / wSum);
-      if (!(gamma > -0.5 && gamma < 0.9)) gamma = 0;
-      const sigma = Math.max(1e-9, meanEx * Math.max(0.05, 1 - gamma));
-      const surv = (x: number): number => {
-        const z = (x - uSol) / sigma;
-        if (z <= 0) return 1;
-        return Math.abs(gamma) < 1e-9 ? Math.exp(-z) : Math.pow(Math.max(1e-12, 1 + gamma * z), -1 / gamma);
-      };
-      for (let b = uBin + 1; b < bins; b++) {
-        const loSol = Math.pow(10, edges[b - 1]!);
-        const hiSol = b === edges.length ? Infinity : Math.pow(10, edges[b]!);
-        mixArr[b] = wSum * (surv(loSol) - (hiSol === Infinity ? 0 : surv(hiSol)));
-      }
-      const t = mixArr.reduce((a, v) => a + v, 0);
-      if (t > 0) for (let b = 0; b < bins; b++) mixArr[b] = mixArr[b]! / t;
-    }
-  }
-  const probs = new Array<number>(bins).fill(0);
-  for (let b = 0; b < bins; b++) probs[b] = (1 - W_BAR) * mixArr[b]! + W_BAR * pn[b]!;
   const sm = new Array<number>(bins).fill(0);
   for (let b = 0; b < bins; b++) {
     const lo = b > 0 ? probs[b - 1]! : 0;
