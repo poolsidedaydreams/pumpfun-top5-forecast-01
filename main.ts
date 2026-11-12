@@ -1,81 +1,44 @@
-// pumpfun-top5-forecast-01, entry v5 (Node 22, standard library only).
+// pumpfun-top5-forecast-01, entry v6 (Node 22, standard library only).
 // No network, no API keys, no model calls; fully deterministic (fixed seed).
 //
-// v5 = v3 + three targeted patches (see BUILD_LOG.md for the full record,
-// the ablation evidence, and the honest risks). v5 is deliberately built
-// on the v3 basis, NOT on v4: v4 scored worse than v3 on the practice
-// server (-39.55 vs -37.31) despite a much better local score, and the
-// v5 ablation lab isolated the damage to v4's pool-only newcomer cap.
-// The three patches, all verified in the lab from the v3 basis:
+// v6 = v5 + two targeted patches (see BUILD_LOG.md for the full record,
+// the ablation evidence, and the honest risks). v5 has no server score
+// (its first submission was rejected on transcript-bundle checks, not on
+// code); v3 (-37.31 practice) remains the best server-verified entry.
+// The two patches, both verified in the v6 lab from the v5 basis:
 //
-//   P1. ARRIVAL SPAN + CADENCE (bug fix). The arrival-rate span now adds
-//       the median inter-mark gap (cadence) to the first-to-last span of
-//       the recent window, and a single mark uses the cadence instead of
-//       a flat 1 hour. The 0.25h floor and 60/h cap are unchanged. The
-//       local +1.22 nats this showed is a thin-cut artefact (cut 2 only);
-//       on the full 66-mark history its effect is ~0. Do not claim it
-//       as a final-horizon gain.
-//   P2. SIZE MIXTURE WEIGHT = u. Sizes mix the known/newcomer histograms
-//       by the order unnamed mass u (as v1/v2 did) instead of the
-//       simulation's own newcomer frequency. In the lab this moves the
-//       long-horizon size means DOWN toward realised levels (an
-//       anti-extrapolation direction) and wins +0.33 locally.
-//   P3. ESS-GATED BLEND WEIGHT w(h). The horizon-gated blend weight is
-//       now driven by the effective sample size of lag evidence near
-//       each horizon (Gaussian kernel, 0.5h bandwidth, over lag points):
-//       where lag evidence is dense the anchor weight drops toward 0,
-//       where it is thin the full SIZE_BLEND_MAX applies. SIZE_BLEND_MAX
-//       (0.3) is unchanged; the old rational form and its half-saturation
-//       constant are superseded (SIZE_BLEND_HALF_H is retained unused).
+//   Q1. SIZE BLEND CEILING 0.3 -> 0.5. The place-normal anchor (the
+//       conservative size component) carries more weight at long
+//       horizons, where the Monte Carlo extrapolates roughly a decade
+//       above realised caps. The ESS gate is unchanged, so short-horizon
+//       reads barely feel it (splits cost -0.03). Evidence: the anchor
+//       direction wins on all six synthetic long-horizon datasets (four
+//       regimes, two seeds; +1.9 to +2.5) — but those magnitudes are
+//       overstated (the synthetic truth is mean-reverting like the
+//       anchor), so only the DIRECTION is claimed, with a winner's-curse
+//       haircut. Doses above 0.5 were deliberately not explored: chasing
+//       the synthetic optimum would be selecting on the test set.
+//   Q2. HORIZON-MIX-GATED TEMPERING. The final size probabilities are
+//       sharpened by alpha = 1 + 0.15*exp(-hbar/2), where hbar is the
+//       mean read horizon: ~1.13 on short-horizon splits (where a
+//       sharpening signal was measured), ~1.001 at the final's 7-13h
+//       (effectively off — verified identical long-horizon shape and
+//       ~0.00 synthetic transfer). The forecast schema carries ONE size
+//       distribution per place for all reads, so per-read gating is
+//       impossible; the horizon MIX is the legitimate gate. The splits
+//       gain (+0.08) is within noise and is NOT claimed as established.
 //
-// Everything else is v3 verbatim: the same Monte Carlo machinery
+// Everything else is v5 verbatim: the same Monte Carlo machinery
 // (per-coin log-cap paths with momentum saturation, fade hazard,
 // graduation jumps, plus a synthetic newcomer field whose count scales
 // with the horizon and whose caps come from the history's young top-20
-// coins), with v3's six repairs. In short, v2's split deficit was
-// traced to three interacting defects:
-//
-//   1. THE LAG FIT COULD NOT REPRESENT FAST TURNOVER. fitSaturating's grid
-//      floored tau at 0.5h and capped fInf at 0.8, discarded buckets with
-//      fewer than 8 points, and shrank toward a slow prior (0.5, 2h). The
-//      history's own lag buckets show 60-90% of top-5 slots turning over
-//      within 10-30 minutes, yet the fitted curve predicted 4-10% at those
-//      lags. v1 survived only because its over-drawn newcomer field inflated
-//      the simulated newcomer frequency, which the max() in the unnamed-mass
-//      rule mistook for the fit. v2's correct horizon-scaled count removed
-//      that accidental compensation without repairing the fit, so the
-//      unnamed mass collapsed exactly on newcomer-held slots. v3 repairs
-//      the NEWCOMER fit only (wider grid, count-weighted buckets, a
-//      single-bucket fallback, a faster prior); the FADE fit is kept
-//      byte-for-byte v1/v2, because ablating a repaired fade fit cost
-//      1.7 nats: lag "fade" events are mostly rank churn and recorder
-//      sampling artefacts, not deaths to the tail floor.
-//   2. SIZES DOUBLE-COUNTED THE FIT. The size mixture weighted the
-//      newcomer-holder histogram by the order unnamed mass u, but u and
-//      the simulated newcomer frequency disagree exactly when the field
-//      is thin, and the newcomer conditional histogram is then a biased,
-//      noisy sample. Sizes score the MARGINAL place-cap distribution, so
-//      v3 mixes by the simulation's own newcomer frequency and lets the
-//      field model speak for the marginal. (v5 P2 revisits this: the lab
-//      found mixing by u wins on splits and transfers positively on
-//      synthetic long-horizon regimes, because it pulls size means down
-//      toward realised levels. The disagreement between the two weightings
-//      is itself evidence the field model extrapolates too high.)
-//   3. THE SIZE BLEND WAS HORIZON-BLIND. Blending 25% of a stationary
-//      place normal helps at 7-13h (where the simulation extrapolates)
-//      but drags sizes down and thins them at short horizons in a rising
-//      regime. v3 gates the blend weight by horizon: ~0.02-0.06 at
-//      sub-hour horizons, ~0.24 at the final's 7-13h. (v5 P3 replaces
-//      the rational gate with an ESS gate keyed to lag evidence.)
-//
-// The remaining v3 changes: sparse marks (<10 rows) are excluded from lag
-// pairs (an empty mark cannot define "seen"); the size histogram is kernel
-// smoothed one bin each way (Monte Carlo histograms are noisy and the log
-// score punishes near-zero bins asymmetrically); the record trend is fitted
-// to the top-5 mean level instead of the single noisiest series (place 1),
-// with the same shrinkage and caps. All parameters are estimated from the
-// history given; nothing is hard-coded to the rehearsal. All horizons and
-// times are read from task.json.
+// coins), with v3's six repairs and v5's three patches (arrival span +
+// cadence bug fix; size mixture weight = u; ESS-gated blend weight).
+// The lineage, the v4 failure diagnosis (pool-only newcomer cap), and
+// the rejected v6 candidates (saturating trend, newcomer-tail removal)
+// are recorded in BUILD_LOG.md. All parameters are estimated from the
+// history given; nothing is hard-coded to the rehearsal. All horizons
+// and times are read from task.json.
 //
 // Reads $MAKEFUN_INPUT_DIR (else /input), writes $MAKEFUN_OUTPUT_DIR (else /output).
 
@@ -93,8 +56,8 @@ const MICRO = 1_000_000;
 const NEWCOMER_CAP = 200;
 /** Prior weight (in lag points) shrinking each per-place newcomer fit. */
 const PLACE_PRIOR_WEIGHT = 30;
-/** Ceiling of the horizon-gated size-blend weight (reached at long horizons). */
-const SIZE_BLEND_MAX = 0.3;
+/** Ceiling of the horizon-gated size-blend weight (reached at long horizons). v6 Q1: raised 0.3 -> 0.5; see header + BUILD_LOG.md. */
+const SIZE_BLEND_MAX = 0.5;
 /** Half-saturation horizon (hours) of the size-blend weight (v3 rational gate; superseded by the v5 ESS gate, retained unused). */
 const SIZE_BLEND_HALF_H = 2;
 /** Kernel smoothing the per-place size histogram (must sum to 1). */
@@ -680,7 +643,15 @@ for (let k = 1; k <= places; k++) {
     sm[b] = SIZE_SMOOTH_KERNEL[0]! * lo + SIZE_SMOOTH_KERNEL[1]! * probs[b]! + SIZE_SMOOTH_KERNEL[2]! * hi;
   }
   const tot = sm.reduce((a, v) => a + v, 0);
-  const finalProbs = tot > 0 ? sm.map((v) => v / tot) : sm;
+  // v6 Q2: horizon-mix-gated tempering. alpha ~1.13 on short-horizon
+  // read sets, ~1.001 at the final's 7-13h (effectively off). The
+  // gate uses the MEAN horizon because the schema emits one size
+  // distribution per place for all reads; see header + BUILD_LOG.md.
+  const TEMP_ALPHA = 1 + 0.15 * Math.exp(-(horizons.reduce((a, h) => a + h, 0) / Math.max(1, horizons.length)) / 2.0);
+  const rawProbs = tot > 0 ? sm.map((v) => v / tot) : sm;
+  const tp = rawProbs.map((v) => Math.pow(Math.max(v, 1e-12), TEMP_ALPHA));
+  const tpsum = tp.reduce((a, v) => a + v, 0);
+  const finalProbs = tpsum > 0 ? tp.map((v) => v / tpsum) : rawProbs;
   for (let b = 0; b < bins; b++) {
     const p = Math.floor(finalProbs[b]! * MICRO) / MICRO;
     if (p > 0) sizes.push({ place: k, bin: b, p });
